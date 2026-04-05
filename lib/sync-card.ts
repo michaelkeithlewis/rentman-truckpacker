@@ -51,7 +51,8 @@ export function buildSyncCardEntity(
     packId,
     visible: true,
     childrenIds: [],
-    position: { x: -3, y: 0.01, z: 1.25 },
+    // Placed far to the left, well away from the new-items staging area
+    position: { x: -8, y: 0.01, z: 1.25 },
     quaternion: { x: 0, y: 0, z: 0, w: 1 },
     size: { x: 4, y: 0.02, z: 2.5 },
     caseData: {

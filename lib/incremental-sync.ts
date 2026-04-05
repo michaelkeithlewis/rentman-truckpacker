@@ -192,9 +192,9 @@ export async function syncOneProject(
   }
 
   // Check for equipment that needs to be ADDED or has QUANTITY changes
-  // New items are placed outside the pack at negative X so they don't
-  // disrupt the user's manual arrangement inside the container
-  let newItemX = -1;
+  // New items are placed to the left of the pack (negative X) with a gap,
+  // so they're clearly separate from the container. Sync card is at x=-8.
+  let newItemX = -2;
   let newItemZ = 0;
   let newItemRowDepth = 0;
 
