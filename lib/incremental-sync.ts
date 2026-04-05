@@ -119,7 +119,19 @@ export async function syncOneProject(
   if (existingPack) {
     packId = existingPack._id;
   } else {
-    const pack = await createPack({ name: `[RM:${pid}] #${pNum} ${pName}` }, tpKey);
+    // Assign folder based on project end date: past = archive, future = active
+    let folderId: string | undefined;
+    const endDate = project.usageperiod_end ?? project.planperiod_end;
+    if (endDate) {
+      const isPast = new Date(endDate) < new Date();
+      const archiveFolder = process.env.TRUCKPACKER_FOLDER_ARCHIVE;
+      const activeFolder = process.env.TRUCKPACKER_FOLDER_ACTIVE;
+      folderId = isPast ? archiveFolder : activeFolder;
+    }
+    const pack = await createPack({
+      name: `[RM:${pid}] #${pNum} ${pName}`,
+      folderId: folderId || undefined,
+    }, tpKey);
     packId = pack._id;
     allPacks.push(pack);
     isNewPack = true;
