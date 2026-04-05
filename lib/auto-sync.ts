@@ -7,7 +7,7 @@
 import * as log from "@/lib/logger";
 import { acquireLock, releaseLock, isSyncing } from "@/lib/sync-lock";
 
-const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const INTERVAL_MS = 30 * 60 * 1000; // 30 minutes (webhooks handle instant updates)
 
 const gKey = Symbol.for("app.autoSync");
 const g = globalThis as unknown as Record<symbol, NodeJS.Timeout | null>;
