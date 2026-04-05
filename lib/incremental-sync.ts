@@ -142,7 +142,7 @@ export async function syncOneProject(
 
   // Separate Rentman-owned entities from TP-native ones
   const rmEntities = existingEntities.filter(isRentmanEntity);
-  // TP-native entities are NEVER touched
+  log.debug("sync", `Pack "${pName}": ${existingEntities.length} existing entities, ${rmEntities.length} RM-tagged`, { packId, isNewPack });
 
   // Build desired equipment map: equipId → count
   const desiredEquip = new Map<number, { equip: Equipment; qty: number }>();
