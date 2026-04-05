@@ -157,12 +157,12 @@ export async function syncOneProject(
 
   // Count existing RM entities per equipment ID
   const existingRmCounts = new Map<string, TPEntity[]>();
-  let existingSyncCard: TPEntity | undefined;
+  const existingSyncCards: TPEntity[] = [];
   let existingVehicleEntity: TPEntity | undefined;
 
   for (const e of rmEntities) {
-    if (e.name.startsWith("SYNC LOG")) {
-      existingSyncCard = e;
+    if (e.name.startsWith("SYNC LOG") || e.name.startsWith("SYNC:")) {
+      existingSyncCards.push(e);
       continue;
     }
     if (RM_VEHICLE_RE.test(e.name)) {
@@ -284,8 +284,8 @@ export async function syncOneProject(
     vehicleRemoved = true;
   }
 
-  // Sync card: always update (delete old + create new)
-  if (existingSyncCard) toDelete.push(existingSyncCard._id);
+  // Sync card: always update (delete ALL old cards + create one new)
+  for (const card of existingSyncCards) toDelete.push(card._id);
   const slCat = await resolveCategory("Sync Log");
   const now = new Date().toISOString();
   toAdd.push(buildSyncCardEntity(packId, slCat, {
