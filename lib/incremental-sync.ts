@@ -39,7 +39,7 @@ const RM_TAG_RE = /\[RM:(\w+)\]/;
 const RM_VEHICLE_RE = /\[RM:V(\d+)\]/;
 
 function isRentmanEntity(e: TPEntity): boolean {
-  return RM_TAG_RE.test(e.name);
+  return RM_TAG_RE.test(e.name) || e.name.startsWith("SYNC LOG") || e.name.startsWith("SYNC:");
 }
 
 function extractRmTag(name: string): string | null {
