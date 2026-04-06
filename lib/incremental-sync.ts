@@ -26,7 +26,8 @@ import {
 import type { Equipment, Project, ProjectStatus } from "@/lib/rentman";
 import { buildSyncCardEntity } from "@/lib/sync-card";
 import type { SyncCardData } from "@/lib/sync-card";
-import { isSyncCard } from "@/lib/sync-card";
+import { smartPack, packedToEntities } from "@/lib/smart-pack";
+import type { } from "@/lib/sync-card";
 
 const CM_TO_M = 0.01;
 const FALLBACK = 0.3;
@@ -191,83 +192,115 @@ export async function syncOneProject(
 
   // Compute diff
   const toDelete: string[] = [];
-  const toAdd: Parameters<typeof batchCreateEntities>[0] = [];
+  let toAdd: Parameters<typeof batchCreateEntities>[0] = [];
   let unchanged = 0;
 
   // Check for equipment that was REMOVED from the project
   for (const [tag, entities] of existingRmCounts) {
     const eqId = parseInt(tag, 10);
     if (!desiredEquip.has(eqId)) {
-      // This equipment is no longer on the project — delete all its entities
       for (const e of entities) toDelete.push(e._id);
     }
   }
 
-  // Check for equipment that needs to be ADDED or has QUANTITY changes
-  // New items are placed to the left of the pack (negative X) with a gap,
-  // so they're clearly separate from the container. Sync card is at x=-8.
-  let newItemX = -2;
-  let newItemZ = 0;
-  let newItemRowDepth = 0;
-
-  for (const [eqId, { equip: eq, qty }] of desiredEquip) {
-    const tag = String(eqId);
-    const existingList = existingRmCounts.get(tag) ?? [];
-    const existingCount = existingList.length;
-
-    const l = eq.length ?? 0, w = eq.width ?? 0, h = eq.height ?? 0;
-    // Items without dims are already filtered out above, so these will always have values
-    const dx = l * CM_TO_M;
-    const dy = h * CM_TO_M;
-    const dz = w * CM_TO_M;
-
-    if (existingCount === qty) {
-      // Correct count — leave them alone (they may have been repositioned by the user)
-      unchanged += qty;
-      continue;
-    }
-
-    if (existingCount > qty) {
-      // Too many — delete the extras
-      const extras = existingList.slice(qty);
-      for (const e of extras) toDelete.push(e._id);
-      unchanged += qty;
-      continue;
-    }
-
-    // Need more — keep existing ones, add the difference
-    unchanged += existingCount;
-    const toAddCount = qty - existingCount;
-
+  // Resolve categories for all equipment
+  const equipCategories = new Map<number, { catId: string; catName: string }>();
+  for (const [eqId, { equip: eq }] of desiredEquip) {
     let fp = "Uncategorized";
     if (eq.folder) { try { fp = folderMap.get(parseRefId(eq.folder)) ?? fp; } catch {} }
     const catId = await resolveCategory(fp);
-    const nm = eq.displayname ?? eq.name;
+    equipCategories.set(eqId, { catId, catName: fp });
+  }
 
-    for (let i = 0; i < toAddCount; i++) {
-      const idx = existingCount + i + 1;
-      // Place new items OUTSIDE the pack (negative X) so they don't
-      // disrupt any manually arranged layout inside the container
-      if (newItemZ + dz > 3 && newItemZ > 0) {
-        newItemX -= (newItemRowDepth + 0.1);
-        newItemZ = 0;
-        newItemRowDepth = 0;
-      }
-      toAdd.push({
-        name: qty > 1 ? `${nm} #${idx} [RM:${eq.id}]` : `${nm} [RM:${eq.id}]`,
-        type: "case", packId, visible: true, childrenIds: [],
-        position: { x: newItemX - dx / 2, y: dy / 2, z: newItemZ + dz / 2 },
-        quaternion: { x: 0, y: 0, z: 0, w: 1 },
-        size: { x: dx, y: dy, z: dz },
-        caseData: {
+  if (isNewPack) {
+    // ── FIRST SYNC: Smart packing into the container ──
+    const containerWidth = vehicle ? (vehicle.width ?? 0) * CM_TO_M || 2.5 : 2.5;
+    const containerHeight = vehicle ? (vehicle.height ?? 0) * CM_TO_M || 2.5 : 2.5;
+
+    const packableItems: Array<{
+      name: string; equipId: number;
+      dx: number; dy: number; dz: number;
+      weight?: number; categoryId: string; category: string;
+    }> = [];
+    const quantities = new Map<number, number>();
+
+    for (const [eqId, { equip: eq, qty }] of desiredEquip) {
+      const l = eq.length ?? 0, w = eq.width ?? 0, h = eq.height ?? 0;
+      const dx = l * CM_TO_M, dy = h * CM_TO_M, dz = w * CM_TO_M;
+      const cat = equipCategories.get(eqId)!;
+      const nm = eq.displayname ?? eq.name;
+      quantities.set(eqId, qty);
+
+      for (let i = 0; i < qty; i++) {
+        packableItems.push({
+          name: nm, equipId: eqId,
+          dx, dy, dz,
           weight: eq.weight && eq.weight > 0 ? eq.weight : undefined,
-          manufacturer: `Rentman #${eq.id}`,
-          canRotate3d: false,
-          categoryId: catId,
-        },
-      });
-      newItemZ += dz;
-      if (dx > newItemRowDepth) newItemRowDepth = dx;
+          categoryId: cat.catId, category: cat.catName,
+        });
+      }
+    }
+
+    const packed = smartPack(packableItems, containerWidth, containerHeight);
+    toAdd = packedToEntities(packed, packId, quantities);
+    unchanged = 0;
+
+    log.info("sync", `Smart-packed ${toAdd.length} items into new pack "${pName}"`);
+  } else {
+    // ── SUBSEQUENT SYNC: Incremental diff, staging area for new items ──
+    let newItemX = -2;
+    let newItemZ = 0;
+    let newItemRowDepth = 0;
+
+    for (const [eqId, { equip: eq, qty }] of desiredEquip) {
+      const tag = String(eqId);
+      const existingList = existingRmCounts.get(tag) ?? [];
+      const existingCount = existingList.length;
+
+      const l = eq.length ?? 0, w = eq.width ?? 0, h = eq.height ?? 0;
+      const dx = l * CM_TO_M, dy = h * CM_TO_M, dz = w * CM_TO_M;
+
+      if (existingCount === qty) {
+        unchanged += qty;
+        continue;
+      }
+
+      if (existingCount > qty) {
+        const extras = existingList.slice(qty);
+        for (const e of extras) toDelete.push(e._id);
+        unchanged += qty;
+        continue;
+      }
+
+      // Need more — place new items in staging area (negative X)
+      unchanged += existingCount;
+      const toAddCount = qty - existingCount;
+      const cat = equipCategories.get(eqId)!;
+      const nm = eq.displayname ?? eq.name;
+
+      for (let i = 0; i < toAddCount; i++) {
+        const idx = existingCount + i + 1;
+        if (newItemZ + dz > 3 && newItemZ > 0) {
+          newItemX -= (newItemRowDepth + 0.1);
+          newItemZ = 0;
+          newItemRowDepth = 0;
+        }
+        toAdd.push({
+          name: qty > 1 ? `${nm} #${idx} [RM:${eq.id}]` : `${nm} [RM:${eq.id}]`,
+          type: "case", packId, visible: true, childrenIds: [],
+          position: { x: newItemX - dx / 2, y: dy / 2, z: newItemZ + dz / 2 },
+          quaternion: { x: 0, y: 0, z: 0, w: 1 },
+          size: { x: dx, y: dy, z: dz },
+          caseData: {
+            weight: eq.weight && eq.weight > 0 ? eq.weight : undefined,
+            manufacturer: `Rentman #${eq.id}`,
+            canRotate3d: false,
+            categoryId: cat.catId,
+          },
+        });
+        newItemZ += dz;
+        if (dx > newItemRowDepth) newItemRowDepth = dx;
+      }
     }
   }
 
