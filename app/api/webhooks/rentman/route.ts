@@ -174,7 +174,7 @@ async function handleProjectChange(
     const first = payload.items[0];
     if (typeof first === "number") {
       if (payload.eventType === "delete") {
-        await handleDeleteEvent(payload, tpKey);
+        await handleDeleteEvent(payload, rmToken, tpKey);
         return;
       }
       // Non-delete with a bare number — can't resolve
@@ -249,39 +249,58 @@ async function handleProjectChange(
 }
 
 /**
- * Handle delete events where Rentman sends bare item IDs with no parent.
- * Scans all RM packs for entities matching the deleted IDs and removes them.
+ * Handle delete events by running an incremental sync on all confirmed projects.
+ * Delete payloads only contain ProjectEquipment/ProjectVehicle IDs (not Equipment
+ * or Vehicle IDs), so we can't match entities directly. Instead, the incremental
+ * sync detects what's missing from each Rentman project and removes it from TP.
  */
-async function handleDeleteEvent(payload: WebhookPayload, tpKey: string) {
-  const deletedIds = (payload.items as number[]).map(String);
+async function handleDeleteEvent(
+  payload: WebhookPayload,
+  rmToken: string,
+  tpKey: string
+) {
+  const ids = (payload.items as number[]).join(", ");
+  log.info("webhook", `Delete ${payload.itemType} #${ids} — running incremental sync on all projects`);
 
-  // Build regex patterns to match entity names like [RM:4951] or [RM:V59]
-  const isVehicle = payload.itemType === "ProjectVehicle";
-  const patterns = deletedIds.map(id =>
-    isVehicle ? `[RM:V${id}]` : `[RM:${id}]`
+  const { listProjects, listFolders } = await import("@/lib/rentman");
+
+  const [projects, folders, allPacks, existingCats] = await Promise.all([
+    listProjects(100, rmToken),
+    listFolders(rmToken),
+    listPacks(tpKey),
+    listCaseCategories(tpKey),
+  ]);
+
+  const folderMap = new Map<number, string>();
+  for (const f of folders) folderMap.set(f.id, f.path ?? f.name);
+
+  const catMap = new Map<string, string>();
+  for (const c of existingCats) catMap.set(c.name.trim().toLowerCase(), c._id);
+  const colorIdx = { i: existingCats.length };
+
+  // Only sync projects that HAVE packs (don't create new ones on a delete event)
+  const packProjects = new Set(
+    allPacks
+      .filter(p => p.name?.startsWith("[RM:"))
+      .map(p => p.name?.match(/\[RM:(\d+)\]/)?.[1])
+      .filter(Boolean)
   );
 
-  log.info("webhook", `Delete ${payload.itemType}: searching packs for ${patterns.join(", ")}`);
-
-  const packs = await listPacks(tpKey);
-  const rmPacks = packs.filter(p => p.name?.startsWith("[RM:"));
-
-  let totalDeleted = 0;
-
-  for (const pack of rmPacks) {
-    const entities = await getPackEntities(pack._id, tpKey);
-    const toRemove = entities.filter(e =>
-      patterns.some(pat => e.name.includes(pat))
-    );
-
-    if (toRemove.length > 0) {
-      await batchDeleteEntities(pack._id, toRemove.map(e => e._id), tpKey);
-      totalDeleted += toRemove.length;
-      log.info("webhook", `Removed ${toRemove.length} entities from pack "${pack.name?.slice(0, 50)}"`);
+  let synced = 0;
+  for (const project of projects) {
+    if (!packProjects.has(String(project.id))) continue;
+    try {
+      const result = await syncOneProject(
+        project, allPacks, folderMap, catMap, colorIdx, rmToken, tpKey
+      );
+      if (result && (result.removed > 0 || result.added > 0)) {
+        log.info("webhook", `Delete sync: "${project.name}" +${result.added} -${result.removed}`);
+      }
+      synced++;
+    } catch (e) {
+      log.error("webhook", `Delete sync failed for "${project.name}": ${e instanceof Error ? e.message : e}`);
     }
   }
 
-  if (totalDeleted === 0) {
-    log.debug("webhook", `No matching entities found for deleted ${payload.itemType} IDs`);
-  }
+  log.info("webhook", `Delete sync complete: checked ${synced} projects`);
 }
