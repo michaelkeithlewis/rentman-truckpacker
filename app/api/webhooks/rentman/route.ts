@@ -5,6 +5,8 @@ import {
   listCaseCategories,
   listPacks,
   updateCase,
+  getPackEntities,
+  batchDeleteEntities,
 } from "@/lib/truckpacker";
 import {
   getEquipment as rmGetEquipment,
@@ -171,7 +173,11 @@ async function handleProjectChange(
   } else {
     const first = payload.items[0];
     if (typeof first === "number") {
-      log.info("webhook", `Delete event for ${payload.itemType} #${first} — will be picked up by next auto-sync`);
+      if (payload.eventType === "delete") {
+        await handleDeleteEvent(payload, tpKey);
+        return;
+      }
+      // Non-delete with a bare number — can't resolve
       return;
     }
 
@@ -239,5 +245,43 @@ async function handleProjectChange(
     log.info("webhook", `Project #${projectId} synced: +${result.added} -${result.removed} =${result.unchanged}`);
   } else {
     log.info("webhook", `Project #${projectId} skipped (not confirmed or no equipment)`);
+  }
+}
+
+/**
+ * Handle delete events where Rentman sends bare item IDs with no parent.
+ * Scans all RM packs for entities matching the deleted IDs and removes them.
+ */
+async function handleDeleteEvent(payload: WebhookPayload, tpKey: string) {
+  const deletedIds = (payload.items as number[]).map(String);
+
+  // Build regex patterns to match entity names like [RM:4951] or [RM:V59]
+  const isVehicle = payload.itemType === "ProjectVehicle";
+  const patterns = deletedIds.map(id =>
+    isVehicle ? `[RM:V${id}]` : `[RM:${id}]`
+  );
+
+  log.info("webhook", `Delete ${payload.itemType}: searching packs for ${patterns.join(", ")}`);
+
+  const packs = await listPacks(tpKey);
+  const rmPacks = packs.filter(p => p.name?.startsWith("[RM:"));
+
+  let totalDeleted = 0;
+
+  for (const pack of rmPacks) {
+    const entities = await getPackEntities(pack._id, tpKey);
+    const toRemove = entities.filter(e =>
+      patterns.some(pat => e.name.includes(pat))
+    );
+
+    if (toRemove.length > 0) {
+      await batchDeleteEntities(pack._id, toRemove.map(e => e._id), tpKey);
+      totalDeleted += toRemove.length;
+      log.info("webhook", `Removed ${toRemove.length} entities from pack "${pack.name?.slice(0, 50)}"`);
+    }
+  }
+
+  if (totalDeleted === 0) {
+    log.debug("webhook", `No matching entities found for deleted ${payload.itemType} IDs`);
   }
 }
