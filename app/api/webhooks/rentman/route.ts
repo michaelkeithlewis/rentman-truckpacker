@@ -167,15 +167,31 @@ async function handleProjectChange(
     projectId = typeof first === "number" ? first : first?.id ?? null;
   } else {
     // ProjectEquipment, ProjectEquipmentGroup, ProjectVehicle, ProjectFunction
-    // → get project from parent
     const first = payload.items[0];
-    if (typeof first !== "number" && first?.parent) {
+    if (typeof first === "number") {
+      // Delete events send bare IDs with no parent — can't determine project.
+      // Let the next auto-sync cycle handle it.
+      log.info("webhook", `Delete event for ${payload.itemType} #${first} — will be picked up by next auto-sync`);
+      return;
+    }
+    if (first?.parent) {
       projectId = first.parent.id;
+    } else if (first?.id && payload.itemType === "Project") {
+      projectId = first.id;
     }
   }
 
   if (!projectId) {
-    log.warn("webhook", "Could not determine project ID from payload");
+    // Try to get the project ID directly from the item ref for non-nested types
+    const first = payload.items[0];
+    if (typeof first !== "number" && first?.ref) {
+      const match = first.ref.match(/\/projects\/(\d+)/);
+      if (match) projectId = parseInt(match[1], 10);
+    }
+  }
+
+  if (!projectId) {
+    log.warn("webhook", `Could not determine project ID from ${payload.itemType} ${payload.eventType} — skipping`);
     return;
   }
 
