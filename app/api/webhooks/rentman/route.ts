@@ -155,7 +155,10 @@ async function handleProjectChange(
   rmToken: string,
   tpKey: string
 ) {
-  // Extract the project ID from the webhook payload
+  // Extract the project ID from the webhook payload.
+  // Rentman's hierarchy: Project → Subproject → EquipmentGroup → Equipment
+  // The parent ref might be the equipment GROUP, not the project itself.
+  // We need to walk up until we find itemType "Project" or "Subproject".
   let projectId: number | null = null;
 
   if (payload.itemType === "Project") {
@@ -166,32 +169,48 @@ async function handleProjectChange(
     const first = payload.items[0];
     projectId = typeof first === "number" ? first : first?.id ?? null;
   } else {
-    // ProjectEquipment, ProjectEquipmentGroup, ProjectVehicle, ProjectFunction
     const first = payload.items[0];
     if (typeof first === "number") {
-      // Delete events send bare IDs with no parent — can't determine project.
-      // Let the next auto-sync cycle handle it.
       log.info("webhook", `Delete event for ${payload.itemType} #${first} — will be picked up by next auto-sync`);
       return;
     }
+
     if (first?.parent) {
-      projectId = first.parent.id;
-    } else if (first?.id && payload.itemType === "Project") {
-      projectId = first.id;
+      if (first.parent.itemType === "Project") {
+        // Direct parent is the project
+        projectId = first.parent.id;
+      } else if (first.parent.itemType === "Subproject") {
+        // Parent is a subproject — resolve to its project via API
+        try {
+          const sub = await import("@/lib/rentman").then(m =>
+            m.rentmanGet<{ project: string }>(`/subprojects/${first.parent!.id}`, rmToken)
+          );
+          const match = sub.project.match(/\/projects\/(\d+)/);
+          if (match) projectId = parseInt(match[1], 10);
+        } catch {
+          log.warn("webhook", `Could not resolve subproject #${first.parent.id} to project`);
+        }
+      } else {
+        // Parent is something else (EquipmentGroup, Function, etc.)
+        // Try fetching the parent to find ITS parent (the project/subproject)
+        try {
+          const parentRef = first.parent.ref;
+          const parentData = await import("@/lib/rentman").then(m =>
+            m.rentmanGet<{ project?: string; parent?: { id: number; itemType: string } }>(parentRef, rmToken)
+          );
+          if (parentData.project) {
+            const match = parentData.project.match(/\/projects\/(\d+)/);
+            if (match) projectId = parseInt(match[1], 10);
+          }
+        } catch {
+          log.warn("webhook", `Could not resolve parent ${first.parent.ref} to project`);
+        }
+      }
     }
   }
 
   if (!projectId) {
-    // Try to get the project ID directly from the item ref for non-nested types
-    const first = payload.items[0];
-    if (typeof first !== "number" && first?.ref) {
-      const match = first.ref.match(/\/projects\/(\d+)/);
-      if (match) projectId = parseInt(match[1], 10);
-    }
-  }
-
-  if (!projectId) {
-    log.warn("webhook", `Could not determine project ID from ${payload.itemType} ${payload.eventType} — skipping`);
+    log.warn("webhook", `Could not determine project ID from ${payload.itemType} ${payload.eventType} — will be picked up by next auto-sync`);
     return;
   }
 
