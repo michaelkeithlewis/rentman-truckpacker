@@ -202,8 +202,11 @@ export async function syncOneProject(
     equipCategories.set(eqId, { catId, catName: fp });
   }
 
-  if (isNewPack) {
-    // ── FIRST SYNC: Smart packing into the container ──
+  // Smart pack when the pack has no equipment entities (new pack or previously empty)
+  const hasExistingEquipment = [...existingRmCounts.values()].some(list => list.length > 0);
+
+  if (isNewPack || !hasExistingEquipment) {
+    // ── SMART PACKING: no existing equipment, arrange everything properly ──
     const containerWidth = vehicle ? (vehicle.width ?? 0) * CM_TO_M || 2.5 : 2.5;
     const containerHeight = vehicle ? (vehicle.height ?? 0) * CM_TO_M || 2.5 : 2.5;
 
