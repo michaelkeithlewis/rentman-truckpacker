@@ -8,12 +8,11 @@ import {
 } from "@/lib/truckpacker";
 import {
   getEquipment as rmGetEquipment,
-  listProjects,
+  getProject as rmGetProject,
   listFolders,
 } from "@/lib/rentman";
 import { parseStamp } from "@/lib/providers";
 import { syncOneProject } from "@/lib/incremental-sync";
-import { acquireLock, releaseLock, isSyncing } from "@/lib/sync-lock";
 import crypto from "crypto";
 
 const CM_TO_M = 0.01;
@@ -22,7 +21,9 @@ const FALLBACK = 0.3;
 const RELEVANT_ITEM_TYPES = new Set([
   "Project",
   "ProjectEquipment",
+  "ProjectEquipmentGroup",
   "ProjectVehicle",
+  "ProjectFunction",
   "Equipment",
 ]);
 
@@ -92,8 +93,8 @@ export async function POST(req: Request) {
     if (payload.itemType === "Equipment") {
       await handleEquipmentChange(payload, rmToken, tpKey);
     } else {
-      // Project/ProjectEquipment/ProjectVehicle → incremental sync all
-      await syncAllIncremental(rmToken, tpKey);
+      // Extract the specific project ID and sync ONLY that project
+      await handleProjectChange(payload, rmToken, tpKey);
     }
     return NextResponse.json({ status: "processed" });
   } catch (e: unknown) {
@@ -104,7 +105,7 @@ export async function POST(req: Request) {
 }
 
 /**
- * Equipment dimensions changed → update matching TP case if synced.
+ * Equipment dimensions changed → update matching TP case.
  */
 async function handleEquipmentChange(
   payload: WebhookPayload,
@@ -147,45 +148,61 @@ async function handleEquipmentChange(
 }
 
 /**
- * Incremental sync of all confirmed projects.
+ * Project/ProjectEquipment/ProjectVehicle changed → sync ONLY that project.
  */
-async function syncAllIncremental(rmToken: string, tpKey: string) {
-  if (isSyncing()) {
-    log.warn("webhook", "Sync already in progress — skipping");
+async function handleProjectChange(
+  payload: WebhookPayload,
+  rmToken: string,
+  tpKey: string
+) {
+  // Extract the project ID from the webhook payload
+  let projectId: number | null = null;
+
+  if (payload.itemType === "Project") {
+    if (payload.eventType === "delete") {
+      log.info("webhook", "Project deleted — no action");
+      return;
+    }
+    const first = payload.items[0];
+    projectId = typeof first === "number" ? first : first?.id ?? null;
+  } else {
+    // ProjectEquipment, ProjectEquipmentGroup, ProjectVehicle, ProjectFunction
+    // → get project from parent
+    const first = payload.items[0];
+    if (typeof first !== "number" && first?.parent) {
+      projectId = first.parent.id;
+    }
+  }
+
+  if (!projectId) {
+    log.warn("webhook", "Could not determine project ID from payload");
     return;
   }
-  if (!acquireLock()) return;
 
-  try {
-    const [projects, folders, existingCats] = await Promise.all([
-      listProjects(50, rmToken),
-      listFolders(rmToken),
-      listCaseCategories(tpKey),
-    ]);
-    const allPacks = await listPacks(tpKey);
+  log.info("webhook", `Syncing single project #${projectId}`);
 
-    const folderMap = new Map<number, string>();
-    for (const f of folders) folderMap.set(f.id, f.path ?? f.name);
+  // Fetch just what we need for this one project
+  const [project, folders, allPacks, existingCats] = await Promise.all([
+    rmGetProject(projectId, rmToken),
+    listFolders(rmToken),
+    listPacks(tpKey),
+    listCaseCategories(tpKey),
+  ]);
 
-    const catMap = new Map<string, string>();
-    for (const c of existingCats) catMap.set(c.name.trim().toLowerCase(), c._id);
-    const colorIdx = { i: existingCats.length };
+  const folderMap = new Map<number, string>();
+  for (const f of folders) folderMap.set(f.id, f.path ?? f.name);
 
-    let synced = 0;
-    for (const project of projects) {
-      try {
-        const result = await syncOneProject(
-          project, allPacks, folderMap, catMap, colorIdx, rmToken, tpKey
-        );
-        if (result) synced++;
-      } catch (e) {
-        log.error("webhook", `Failed "${project.name}": ${e instanceof Error ? e.message : e}`);
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
+  const catMap = new Map<string, string>();
+  for (const c of existingCats) catMap.set(c.name.trim().toLowerCase(), c._id);
+  const colorIdx = { i: existingCats.length };
 
-    log.info("webhook", `Incremental sync complete: ${synced} projects updated`);
-  } finally {
-    releaseLock();
+  const result = await syncOneProject(
+    project, allPacks, folderMap, catMap, colorIdx, rmToken, tpKey
+  );
+
+  if (result) {
+    log.info("webhook", `Project #${projectId} synced: +${result.added} -${result.removed} =${result.unchanged}`);
+  } else {
+    log.info("webhook", `Project #${projectId} skipped (not confirmed or no equipment)`);
   }
 }
