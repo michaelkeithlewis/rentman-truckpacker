@@ -1,9 +1,11 @@
 import type { ProviderId } from "./providers/types";
 
 export function activeProvider(req: Request): ProviderId {
+  // Browser header takes priority, then env var, then default
   const header = req.headers.get("x-active-provider");
-  if (header === "currentrms") return "currentrms";
-  if (header === "flex") return "flex";
+  if (header === "currentrms" || header === "flex") return header;
+  const env = process.env.ACTIVE_PROVIDER;
+  if (env === "currentrms" || env === "flex") return env;
   return "rentman";
 }
 
