@@ -1,15 +1,15 @@
 /**
- * Flex Rental Solutions provider — built from the Flex5 OpenAPI spec.
+ * Flex Rental Solutions provider — built from the Flex5 OpenAPI spec
+ * and live API testing against ecp.flexrentalsolutions.com.
  *
- * API reference: https://{site}.flexrentalsolutions.com/f5/swagger-ui.html
- * Auth: X-Auth-Token header
- *
- * Key mappings:
- *   Equipment    = InventoryModel     (/api/inventory-model)
- *   Projects     = Element            (/api/element)
- *   Line items   = EquipmentListLineItemNode via eqlist-line-item
- *   Categories   = InventoryGroup     (/api/inventory-group)
- *   Dimensions   = weight, height, modelLength (not "length"), width
+ * Key discoveries from testing:
+ * - Projects = Elements with definition "Quote" (9bfb850c-b117-11df-b8d5-00e08175e43e)
+ * - List projects via /api/element-list/row-data?definitionId=QUOTE_DEF_ID
+ * - Line items via /api/line-item/{elementId}/row-data/?codeList=RESOURCE_NAME
+ *   Returns flat array with resourceId per row. Quantity = count of rows per resourceId.
+ * - Equipment = InventoryModel (/api/inventory-model/{id})
+ * - Dimension field is "modelLength" not "length"
+ * - IDs are UUIDs (strings), not integers
  */
 
 import type {
@@ -23,17 +23,13 @@ function getBaseUrl(): string {
   let url = process.env.FLEX_BASE_URL;
   if (!url) throw new Error("FLEX_BASE_URL not set (e.g. https://yoursite.flexrentalsolutions.com/f5)");
   url = url.replace(/\/+$/, "");
-  // Remove trailing /api if present — our paths already include /api/
   if (url.endsWith("/api")) url = url.slice(0, -4);
   return url;
 }
 
 async function flexGet<T>(path: string, token: string): Promise<T> {
   const res = await fetch(`${getBaseUrl()}${path}`, {
-    headers: {
-      "X-Auth-Token": token,
-      Accept: "application/json",
-    },
+    headers: { "X-Auth-Token": token, Accept: "application/json" },
     cache: "no-store",
   });
   if (!res.ok) {
@@ -42,100 +38,66 @@ async function flexGet<T>(path: string, token: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function flexPut<T = void>(path: string, body: unknown, token: string): Promise<T> {
+async function flexPut(path: string, body: unknown, token: string): Promise<void> {
   const res = await fetch(`${getBaseUrl()}${path}`, {
     method: "PUT",
-    headers: {
-      "X-Auth-Token": token,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
+    headers: { "X-Auth-Token": token, "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),
     cache: "no-store",
   });
   if (!res.ok) {
     throw new Error(`Flex PUT ${res.status}: ${await res.text()}`);
   }
-  return res.json() as Promise<T>;
 }
 
-// ── Flex5 types from OpenAPI spec ──
+// ── Types from live API responses ──
 
 interface InventoryModel {
   id: string;
   name: string;
   barcode?: string;
   manufacturer?: string;
-  size?: string;
   weight?: number;
   height?: number;
-  modelLength?: number; // "length" is reserved in Flex, uses "modelLength"
+  modelLength?: number;
   width?: number;
-  weightUnitId?: string;
-  linearUnitId?: string;
   groupId?: string;
   masterQuantity?: number;
   replacementCost?: number;
   virtualModel?: boolean;
-  container?: boolean;
-  vehicle?: boolean;
-  stackable?: boolean;
-  shortName?: string;
   shortNameOrName?: string;
 }
 
 interface InventoryGroup {
-  id: string | number;
-  name: string;
-}
-
-// PageProjectElementSearchEntry.content[]
-interface ProjectElementSearchEntry {
   id: string;
   name: string;
-  documentNumber?: string;
-  definitionName?: string;
-  parentName?: string;
 }
 
-// EquipmentList (the full project/element record)
-interface EquipmentList {
+// element-list/row-data response item
+interface ElementListRow {
   id: string;
   name?: string;
-  displayName?: string;
   documentNumber?: string;
-  parentElementId?: string;
-  plannedStartDate?: string;
-  plannedEndDate?: string;
-  eventDate?: string;
-  showStartDate?: string;
-  showEndDate?: string;
-  statusId?: string;
-  weight?: number;
+  parentId?: string;
+  [key: string]: unknown;
 }
 
-// EquipmentListLineItemNode
-interface LineItemNode {
+// line-item/row-data response item
+interface LineItemRow {
   id: string;
-  displayName?: string;
   resourceId?: string;
-  resourceBarcode?: string;
-  group?: boolean;
+  rootLineId?: string;
   leaf?: boolean;
-  virtual?: boolean;
-  lineQtyInfo?: { requiredQty?: number };
+  ordinal?: number;
 }
 
-// Paginated response wrapper
 interface Page<T> {
   content: T[];
   totalElements: number;
   totalPages: number;
-  size: number;
-  number: number;
 }
 
-// ── Group name cache ──
+// ── Group cache ──
 
 const groupCache = new Map<string, string>();
 
@@ -147,40 +109,31 @@ async function loadGroups(token: string) {
   } catch { /* non-critical */ }
 }
 
-// ── Provider implementation ──
+// ── Provider ──
 
 export const flexProvider: Provider = {
-  id: "flex" as "rentman", // type cast — registered properly in index.ts
+  id: "flex" as "rentman",
   name: "Flex Rental Solutions",
   supportsWrite: true,
 
   async listEquipment(token) {
     await loadGroups(token);
-
     const items: ProviderEquipment[] = [];
     let page = 0;
-    const pageSize = 100;
-
     while (true) {
       const result = await flexGet<Page<InventoryModel>>(
-        `/api/inventory-model/search?searchText=&page=${page}&size=${pageSize}`,
-        token
+        `/api/inventory-model/search?searchText=&page=${page}&size=100`, token
       );
-      const models = result.content ?? [];
-      if (models.length === 0) break;
-
-      for (const m of models) items.push(mapModel(m));
-      if (models.length < pageSize) break;
+      for (const m of result.content ?? []) items.push(mapModel(m));
+      if ((result.content?.length ?? 0) < 100) break;
       page++;
     }
-
     return items;
   },
 
   async getEquipment(id, token) {
     await loadGroups(token);
-    const model = await flexGet<InventoryModel>(`/api/inventory-model/${id}`, token);
-    return mapModel(model);
+    return mapModel(await flexGet<InventoryModel>(`/api/inventory-model/${id}`, token));
   },
 
   async updateEquipment(id, fields, token) {
@@ -194,76 +147,87 @@ export const flexProvider: Provider = {
   },
 
   async listProjects(token) {
-    const result = await flexGet<Page<ProjectElementSearchEntry>>(
-      "/api/element/search?searchText=&rootElementsOnly=true&page=0&size=50",
+    // Quotes are the main project type in Flex
+    // Use element-list/row-data with the Quote definition ID
+    const result = await flexGet<Page<ElementListRow>>(
+      "/api/element-list/row-data?definitionId=9bfb850c-b117-11df-b8d5-00e08175e43e&page=0&size=50",
       token
     );
     return (result.content ?? []).map((e) => ({
       sourceId: String(e.id),
-      displayNumber: e.documentNumber ?? String(e.id),
-      name: e.name ?? `Element ${e.id}`,
+      displayNumber: e.documentNumber ?? String(e.id).slice(0, 8),
+      name: e.name ?? `Quote ${e.documentNumber ?? e.id}`,
       startDate: undefined,
       endDate: undefined,
-      color: undefined,
-      tags: e.definitionName,
     }));
   },
 
   async getProject(id, token) {
-    // Get the full equipment list record which has dates and details
-    const el = await flexGet<EquipmentList>(`/api/equipment-list/${id}`, token);
-    return {
-      sourceId: String(el.id ?? id),
-      displayNumber: el.documentNumber ?? String(id),
-      name: el.displayName ?? el.name ?? `Element ${id}`,
-      startDate: el.plannedStartDate ?? el.showStartDate ?? el.eventDate,
-      endDate: el.plannedEndDate ?? el.showEndDate,
-      color: undefined,
-      tags: undefined,
-    };
+    // Try equipment-list which has full details
+    try {
+      const el = await flexGet<{
+        id: string; displayName?: string; name?: string; documentNumber?: string;
+        plannedStartDate?: string; plannedEndDate?: string; eventDate?: string;
+      }>(`/api/equipment-list/${id}`, token);
+      return {
+        sourceId: String(el.id ?? id),
+        displayNumber: el.documentNumber ?? String(id).slice(0, 8),
+        name: el.displayName ?? el.name ?? `Element ${id}`,
+        startDate: el.plannedStartDate ?? el.eventDate,
+        endDate: el.plannedEndDate,
+      };
+    } catch {
+      // Fallback
+      return {
+        sourceId: String(id),
+        displayNumber: String(id).slice(0, 8),
+        name: `Element ${id}`,
+      };
+    }
   },
 
   async listProjectEquipment(projectId, token) {
-    // Get line items via the eqlist-line-item endpoint
-    // First we need a root line item — use node-list with the equipment list ID
-    const items: ProviderProjectEquipmentLine[] = [];
+    // Get line items — each row has a resourceId (inventory model)
+    // Quantity = count of rows with the same resourceId
+    const rows = await flexGet<LineItemRow[]>(
+      `/api/line-item/${projectId}/row-data/?codeList=RESOURCE_NAME`,
+      token
+    );
 
-    try {
-      const result = await flexGet<Page<LineItemNode>>(
-        `/api/eqlist-line-item/node-list/root?equipmentListId=${projectId}&page=0&size=200`,
-        token
-      );
+    if (!Array.isArray(rows) || rows.length === 0) return [];
 
-      for (const node of result.content ?? []) {
-        if (node.group || node.virtual) continue; // skip group headers and virtual items
-        if (!node.resourceId) continue;
-
-        items.push({
-          lineId: String(node.id),
-          equipmentSourceId: String(node.resourceId),
-          name: node.displayName ?? `Item ${node.id}`,
-          quantity: node.lineQtyInfo?.requiredQty ?? 1,
-        });
+    // Count quantity per resource
+    const byResource = new Map<string, { count: number; lineId: string }>();
+    for (const row of rows) {
+      if (!row.resourceId) continue;
+      const existing = byResource.get(row.resourceId);
+      if (existing) {
+        existing.count++;
+      } else {
+        byResource.set(row.resourceId, { count: 1, lineId: row.id });
       }
-    } catch {
-      // Fallback: try the line-item row-data endpoint
-      try {
-        const rows = await flexGet<{ content?: Array<{ id: string; dataMap?: Record<string, unknown> }> }>(
-          `/api/line-item/${projectId}/row-data/`,
-          token
-        );
-        for (const row of rows.content ?? []) {
-          items.push({
-            lineId: String(row.id),
-            equipmentSourceId: String(row.id),
-            name: `Line ${row.id}`,
-            quantity: 1,
-          });
-        }
-      } catch { /* give up */ }
     }
 
-    return items;
+    // Look up resource names
+    const results: ProviderProjectEquipmentLine[] = [];
+    for (const [resourceId, { count, lineId }] of byResource) {
+      let name = `Resource ${resourceId.slice(0, 8)}`;
+      try {
+        const model = await flexGet<InventoryModel>(
+          `/api/inventory-model/${resourceId}`, token
+        );
+        name = model.shortNameOrName ?? model.name;
+      } catch { /* use default name */ }
+
+      results.push({
+        lineId,
+        equipmentSourceId: resourceId,
+        name,
+        quantity: count,
+      });
+    }
+
+    return results;
   },
 };
 
