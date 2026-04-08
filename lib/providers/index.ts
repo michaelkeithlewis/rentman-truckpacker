@@ -1,10 +1,12 @@
 import type { Provider, ProviderId } from "./types";
 import { rentmanProvider } from "./rentman";
 import { currentrmsProvider } from "./currentrms";
+import { flexProvider } from "./flex";
 
 const providers: Record<ProviderId, Provider> = {
   rentman: rentmanProvider,
   currentrms: currentrmsProvider,
+  flex: flexProvider,
 };
 
 export function getProvider(id: ProviderId): Provider {

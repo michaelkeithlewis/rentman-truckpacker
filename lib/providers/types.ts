@@ -1,4 +1,4 @@
-export type ProviderId = "rentman" | "currentrms";
+export type ProviderId = "rentman" | "currentrms" | "flex";
 
 export interface ProviderEquipment {
   sourceId: string;

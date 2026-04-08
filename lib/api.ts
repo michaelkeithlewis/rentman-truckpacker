@@ -2,7 +2,7 @@
 
 // ── Token helpers ──
 
-export type ProviderId = "rentman" | "currentrms";
+export type ProviderId = "rentman" | "currentrms" | "flex";
 
 export function getActiveProvider(): ProviderId {
   if (typeof window === "undefined") return "rentman";
@@ -14,10 +14,11 @@ export function setActiveProvider(id: ProviderId) {
 }
 
 export function getTokens() {
-  if (typeof window === "undefined") return { rentman: "", currentrms: "", truckpacker: "" };
+  if (typeof window === "undefined") return { rentman: "", currentrms: "", flex: "", truckpacker: "" };
   return {
     rentman: localStorage.getItem("rentman_token") ?? "",
     currentrms: localStorage.getItem("currentrms_token") ?? "",
+    flex: localStorage.getItem("flex_token") ?? "",
     truckpacker: localStorage.getItem("truckpacker_key") ?? "",
   };
 }
@@ -30,11 +31,12 @@ export function hasTokens() {
 }
 
 function tokenHeaders(): Record<string, string> {
-  const { rentman, currentrms, truckpacker } = getTokens();
+  const { rentman, currentrms, flex, truckpacker } = getTokens();
   const h: Record<string, string> = {};
   h["x-active-provider"] = getActiveProvider();
   if (rentman) h["x-rentman-token"] = rentman;
   if (currentrms) h["x-currentrms-token"] = currentrms;
+  if (flex) h["x-flex-token"] = flex;
   if (truckpacker) h["x-truckpacker-key"] = truckpacker;
   return h;
 }

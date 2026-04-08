@@ -11,18 +11,27 @@ interface TestResult {
   error?: string;
 }
 
-const PROVIDERS: { id: ProviderId; name: string; tokenHelp: string; placeholder: string }[] = [
+const PROVIDERS: { id: ProviderId; name: string; tokenHelp: string; placeholder: string; storageKey: string }[] = [
   {
     id: "rentman",
     name: "Rentman",
     tokenHelp: "Find your token in Rentman → Configuration → Extensions → Webshop → \"show token\"",
     placeholder: "eyJhbGciOiJIUz...",
+    storageKey: "rentman_token",
   },
   {
     id: "currentrms",
     name: "Current RMS",
     tokenHelp: "Get your API token from Current RMS → System Preferences → API",
     placeholder: "your-currentrms-api-token",
+    storageKey: "currentrms_token",
+  },
+  {
+    id: "flex",
+    name: "Flex Rental Solutions",
+    tokenHelp: "Get your API key from Flex → Main Menu → Integrations → API. Set FLEX_BASE_URL in env vars.",
+    placeholder: "your-flex-api-key",
+    storageKey: "flex_token",
   },
 ];
 
@@ -30,6 +39,7 @@ export default function SettingsPage() {
   const [provider, setProvider] = useState<ProviderId>("rentman");
   const [rentmanToken, setRentmanToken] = useState("");
   const [currentrmsToken, setCurrentrmsToken] = useState("");
+  const [flexToken, setFlexToken] = useState("");
   const [tpKey, setTpKey] = useState("");
   const [saved, setSaved] = useState(false);
   const [srcTest, setSrcTest] = useState<TestResult | null>(null);
@@ -41,15 +51,17 @@ export default function SettingsPage() {
     setProvider(getActiveProvider());
     setRentmanToken(localStorage.getItem("rentman_token") ?? "");
     setCurrentrmsToken(localStorage.getItem("currentrms_token") ?? "");
+    setFlexToken(localStorage.getItem("flex_token") ?? "");
     setTpKey(localStorage.getItem("truckpacker_key") ?? "");
   }, []);
 
   function save() {
     setActiveProvider(provider);
-    if (rentmanToken) localStorage.setItem("rentman_token", rentmanToken);
-    else localStorage.removeItem("rentman_token");
-    if (currentrmsToken) localStorage.setItem("currentrms_token", currentrmsToken);
-    else localStorage.removeItem("currentrms_token");
+    for (const p of PROVIDERS) {
+      const val = tokenForProvider(p.id);
+      if (val) localStorage.setItem(p.storageKey, val);
+      else localStorage.removeItem(p.storageKey);
+    }
     if (tpKey) localStorage.setItem("truckpacker_key", tpKey);
     else localStorage.removeItem("truckpacker_key");
     setSaved(true);
@@ -58,7 +70,23 @@ export default function SettingsPage() {
     setTimeout(() => setSaved(false), 2000);
   }
 
-  const activeToken = provider === "currentrms" ? currentrmsToken : rentmanToken;
+  function tokenForProvider(id: ProviderId): string {
+    switch (id) {
+      case "rentman": return rentmanToken;
+      case "currentrms": return currentrmsToken;
+      case "flex": return flexToken;
+    }
+  }
+
+  function setTokenForProvider(id: ProviderId, val: string) {
+    switch (id) {
+      case "rentman": setRentmanToken(val); break;
+      case "currentrms": setCurrentrmsToken(val); break;
+      case "flex": setFlexToken(val); break;
+    }
+  }
+
+  const activeToken = tokenForProvider(provider);
   const activeCfg = PROVIDERS.find((p) => p.id === provider)!;
 
   async function testSource() {
@@ -131,10 +159,7 @@ export default function SettingsPage() {
           <input
             type="password"
             value={activeToken}
-            onChange={(e) => {
-              if (provider === "currentrms") setCurrentrmsToken(e.target.value);
-              else setRentmanToken(e.target.value);
-            }}
+            onChange={(e) => setTokenForProvider(provider, e.target.value)}
             placeholder={activeCfg.placeholder}
             className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
           />
@@ -155,6 +180,12 @@ export default function SettingsPage() {
           <p className="text-xs text-amber-600 mt-2">
             Current RMS supports bidirectional sync — changes in Truck Packer can
             be pushed back.
+          </p>
+        )}
+        {provider === "flex" && (
+          <p className="text-xs text-amber-600 mt-2">
+            Flex supports bidirectional sync. Set FLEX_BASE_URL in your environment
+            variables (e.g. https://yoursite.flexrentalsolutions.com/f5/api).
           </p>
         )}
         {provider === "rentman" && (

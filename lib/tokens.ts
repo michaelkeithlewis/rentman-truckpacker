@@ -3,6 +3,7 @@ import type { ProviderId } from "./providers/types";
 export function activeProvider(req: Request): ProviderId {
   const header = req.headers.get("x-active-provider");
   if (header === "currentrms") return "currentrms";
+  if (header === "flex") return "flex";
   return "rentman";
 }
 
@@ -12,6 +13,13 @@ export function sourceToken(req: Request): string {
     return (
       req.headers.get("x-currentrms-token") ||
       process.env.CURRENTRMS_API_TOKEN ||
+      ""
+    );
+  }
+  if (provider === "flex") {
+    return (
+      req.headers.get("x-flex-token") ||
+      process.env.FLEX_API_TOKEN ||
       ""
     );
   }
