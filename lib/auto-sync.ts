@@ -48,7 +48,7 @@ async function runSync() {
 
     const { getProvider } = await import("@/lib/providers");
     const { listPacks, listCaseCategories } = await import("@/lib/truckpacker");
-    const { syncOneProject } = await import("@/lib/incremental-sync");
+    const { syncOneProject, syncOneProjectGeneric } = await import("@/lib/incremental-sync");
 
     const provider = getProvider(providerId);
     const projects = await provider.listProjects(srcToken);
@@ -78,10 +78,6 @@ async function runSync() {
     let synced = 0;
     let skipped = 0;
 
-    // Convert provider projects to the format syncOneProject expects
-    // syncOneProject currently expects a Rentman Project type.
-    // For now, only Rentman uses the auto-sync with full incremental sync.
-    // For Flex/CurrentRMS, we use the provider abstraction through the API routes.
     if (providerId === "rentman") {
       const { listProjects: rmListProjects } = await import("@/lib/rentman");
       const rmProjects = await rmListProjects(100, srcToken);
@@ -98,7 +94,19 @@ async function runSync() {
         await new Promise((r) => setTimeout(r, 1000));
       }
     } else {
-      log.info("auto-sync", `Provider ${providerId} uses webhook/manual sync — auto-sync skipped`);
+      // Generic provider sync (Flex, CurrentRMS, etc.)
+      for (const project of projects) {
+        try {
+          const result = await syncOneProjectGeneric(
+            provider, project, allPacks, catMap, colorIdx, srcToken, tpKey
+          );
+          if (result) synced++;
+          else skipped++;
+        } catch (e) {
+          log.error("auto-sync", `Failed "${project.name}": ${e instanceof Error ? e.message : e}`);
+        }
+        await new Promise((r) => setTimeout(r, 1000));
+      }
     }
 
     log.info("auto-sync", `Background sync complete: ${synced} synced, ${skipped} skipped`);

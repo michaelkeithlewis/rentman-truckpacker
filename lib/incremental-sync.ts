@@ -27,7 +27,7 @@ import type { Equipment, Project, ProjectStatus } from "@/lib/rentman";
 import { buildSyncCardEntity } from "@/lib/sync-card";
 import type { SyncCardData } from "@/lib/sync-card";
 import { smartPack, packedToEntities } from "@/lib/smart-pack";
-import type { } from "@/lib/sync-card";
+import type { Provider, ProviderProject, ProviderEquipment } from "@/lib/providers/types";
 
 const CM_TO_M = 0.01;
 const FALLBACK = 0.3;
@@ -357,4 +357,199 @@ export async function syncOneProject(
     vehicleAdded,
     vehicleRemoved,
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Provider-agnostic sync — works with any provider (Flex, CurrentRMS, etc.)
+// ─────────────────────────────────────────────────────────────
+
+export async function syncOneProjectGeneric(
+  provider: Provider,
+  project: ProviderProject,
+  allPacks: Pack[],
+  catMap: Map<string, string>,
+  colorIdx: { i: number },
+  srcToken: string,
+  tpKey: string
+): Promise<SyncProjectResult | null> {
+  const pid = project.sourceId;
+  const pNum = project.displayNumber ?? pid;
+  const pName = project.name.trim();
+
+  const lines = await provider.listProjectEquipment(pid, srcToken);
+  if (lines.length === 0) return null;
+
+  async function resolveCategory(name: string): Promise<string> {
+    const key = name.trim().toLowerCase();
+    if (catMap.has(key)) return catMap.get(key)!;
+    const color = COLORS[colorIdx.i++ % COLORS.length];
+    const cat = await createCaseCategory({ name, colorHex: color }, tpKey);
+    catMap.set(key, cat._id);
+    return cat._id;
+  }
+
+  // Find or create pack
+  const stampPrefix = `[RM:${pid}]`;
+  let existingPack = allPacks.find((p) => p.name?.startsWith(stampPrefix));
+  let packId: string;
+  let isNewPack = false;
+
+  if (existingPack) {
+    packId = existingPack._id;
+  } else {
+    const pack = await createPack({ name: `[RM:${pid}] #${pNum} ${pName}` }, tpKey);
+    packId = pack._id;
+    allPacks.push(pack);
+    isNewPack = true;
+  }
+
+  const existingEntities = isNewPack ? [] : await getPackEntities(packId, tpKey);
+  const rmEntities = existingEntities.filter(isRentmanEntity);
+  log.debug("sync", `Pack "${pName}": ${existingEntities.length} existing, ${rmEntities.length} RM-tagged`, { packId, isNewPack });
+
+  // Build desired equipment
+  const desiredEquip = new Map<string, { equip: ProviderEquipment; qty: number }>();
+  let missDims = 0, uniq = 0;
+
+  for (const line of lines) {
+    if (!line.equipmentSourceId) continue;
+    let eq: ProviderEquipment;
+    try { eq = await provider.getEquipment(line.equipmentSourceId, srcToken); } catch { continue; }
+    if (!eq.isPhysical) continue;
+
+    const hasDims = (eq.length ?? 0) > 0 && (eq.width ?? 0) > 0 && (eq.height ?? 0) > 0;
+    if (!hasDims) { missDims++; continue; }
+
+    uniq++;
+    const existing = desiredEquip.get(eq.sourceId);
+    if (existing) { existing.qty += line.quantity ?? 1; }
+    else { desiredEquip.set(eq.sourceId, { equip: eq, qty: line.quantity ?? 1 }); }
+  }
+
+  // Count existing RM entities
+  const existingRmCounts = new Map<string, TPEntity[]>();
+  const existingSyncCards: TPEntity[] = [];
+
+  for (const e of rmEntities) {
+    if (e.name.startsWith("SYNC LOG") || e.name.startsWith("SYNC:")) {
+      existingSyncCards.push(e);
+      continue;
+    }
+    const tag = extractRmTag(e.name);
+    if (tag) {
+      const list = existingRmCounts.get(tag) ?? [];
+      list.push(e);
+      existingRmCounts.set(tag, list);
+    }
+  }
+
+  // Resolve categories
+  const equipCategories = new Map<string, string>();
+  for (const [eqId, { equip: eq }] of desiredEquip) {
+    const catId = await resolveCategory(eq.category);
+    equipCategories.set(eqId, catId);
+  }
+
+  const toDelete: string[] = [];
+  let toAdd: Parameters<typeof batchCreateEntities>[0] = [];
+  let unchanged = 0;
+
+  // Remove items no longer on the project
+  for (const [tag, entities] of existingRmCounts) {
+    if (!desiredEquip.has(tag)) {
+      for (const e of entities) toDelete.push(e._id);
+    }
+  }
+
+  const hasExistingEquipment = [...existingRmCounts.values()].some(list => list.length > 0);
+
+  if (isNewPack || !hasExistingEquipment) {
+    // Smart pack
+    const packableItems: Array<{
+      name: string; equipId: number; dx: number; dy: number; dz: number;
+      weight?: number; categoryId: string; category: string;
+    }> = [];
+    const quantities = new Map<number, number>();
+
+    for (const [, { equip: eq, qty }] of desiredEquip) {
+      const dx = (eq.length ?? 0) * CM_TO_M;
+      const dy = (eq.height ?? 0) * CM_TO_M;
+      const dz = (eq.width ?? 0) * CM_TO_M;
+      const catId = equipCategories.get(eq.sourceId)!;
+      const numId = parseInt(eq.sourceId, 10) || 0;
+      quantities.set(numId, qty);
+
+      for (let i = 0; i < qty; i++) {
+        packableItems.push({
+          name: eq.name, equipId: numId, dx, dy, dz,
+          weight: eq.weight, categoryId: catId, category: eq.category,
+        });
+      }
+    }
+
+    const packed = smartPack(packableItems, 2.5, 2.5);
+    toAdd = packedToEntities(packed, packId, quantities);
+    log.info("sync", `Smart-packed ${toAdd.length} items for "${pName}"`);
+  } else {
+    // Incremental — staging area for new items
+    let newItemX = -2, newItemZ = 0, newItemRowDepth = 0;
+
+    for (const [eqId, { equip: eq, qty }] of desiredEquip) {
+      const existingList = existingRmCounts.get(eqId) ?? [];
+      const existingCount = existingList.length;
+      const dx = (eq.length ?? 0) * CM_TO_M;
+      const dy = (eq.height ?? 0) * CM_TO_M;
+      const dz = (eq.width ?? 0) * CM_TO_M;
+
+      if (existingCount === qty) { unchanged += qty; continue; }
+      if (existingCount > qty) {
+        for (const e of existingList.slice(qty)) toDelete.push(e._id);
+        unchanged += qty; continue;
+      }
+
+      unchanged += existingCount;
+      const catId = equipCategories.get(eqId)!;
+
+      for (let i = 0; i < qty - existingCount; i++) {
+        const idx = existingCount + i + 1;
+        if (newItemZ + dz > 3 && newItemZ > 0) {
+          newItemX -= (newItemRowDepth + 0.1); newItemZ = 0; newItemRowDepth = 0;
+        }
+        toAdd.push({
+          name: qty > 1 ? `${eq.name} #${idx} [RM:${eq.sourceId}]` : `${eq.name} [RM:${eq.sourceId}]`,
+          type: "case", packId, visible: true, childrenIds: [],
+          position: { x: newItemX - dx / 2, y: dy / 2, z: newItemZ + dz / 2 },
+          quaternion: { x: 0, y: 0, z: 0, w: 1 },
+          size: { x: dx, y: dy, z: dz },
+          caseData: { weight: eq.weight, manufacturer: `${provider.name} #${eq.sourceId}`, canRotate3d: false, categoryId: catId },
+        });
+        newItemZ += dz;
+        if (dx > newItemRowDepth) newItemRowDepth = dx;
+      }
+    }
+  }
+
+  // Sync cards
+  for (const card of existingSyncCards) toDelete.push(card._id);
+  const slCat = await resolveCategory("Sync Log");
+  const now = new Date().toISOString();
+  toAdd.push(buildSyncCardEntity(packId, slCat, {
+    projectName: `#${pNum} ${pName}`, projectId: pid, provider: provider.name,
+    projectCreated: project.startDate ?? now,
+    lastSynced: now,
+    totalItems: uniq, totalEntities: unchanged + toAdd.length,
+    missingDimensions: missDims,
+  } satisfies SyncCardData));
+
+  if (toDelete.length > 0) {
+    for (let i = 0; i < toDelete.length; i += 50)
+      await batchDeleteEntities(packId, toDelete.slice(i, i + 50), tpKey);
+  }
+  if (toAdd.length > 0) {
+    for (let i = 0; i < toAdd.length; i += 50)
+      await batchCreateEntities(toAdd.slice(i, i + 50), tpKey);
+  }
+
+  log.info("sync", `"${pName}": +${toAdd.length} -${toDelete.length} =${unchanged}`);
+  return { added: toAdd.length, removed: toDelete.length, unchanged, vehicleAdded: false, vehicleRemoved: false };
 }
