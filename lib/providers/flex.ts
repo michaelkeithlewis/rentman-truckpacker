@@ -1,3 +1,17 @@
+/**
+ * Flex Rental Solutions provider — built from the Flex5 OpenAPI spec.
+ *
+ * API reference: https://{site}.flexrentalsolutions.com/f5/swagger-ui.html
+ * Auth: X-Auth-Token header
+ *
+ * Key mappings:
+ *   Equipment    = InventoryModel     (/api/inventory-model)
+ *   Projects     = Element            (/api/element)
+ *   Line items   = EquipmentListLineItemNode via eqlist-line-item
+ *   Categories   = InventoryGroup     (/api/inventory-group)
+ *   Dimensions   = weight, height, modelLength (not "length"), width
+ */
+
 import type {
   Provider,
   ProviderEquipment,
@@ -15,18 +29,17 @@ async function flexGet<T>(path: string, token: string): Promise<T> {
   const res = await fetch(`${getBaseUrl()}${path}`, {
     headers: {
       "X-Auth-Token": token,
-      "Content-Type": "application/json",
       Accept: "application/json",
     },
     cache: "no-store",
   });
   if (!res.ok) {
-    throw new Error(`Flex API ${res.status}: ${await res.text()}`);
+    throw new Error(`Flex ${res.status}: ${await res.text()}`);
   }
   return res.json() as Promise<T>;
 }
 
-async function flexPut(path: string, body: unknown, token: string): Promise<void> {
+async function flexPut<T = void>(path: string, body: unknown, token: string): Promise<T> {
   const res = await fetch(`${getBaseUrl()}${path}`, {
     method: "PUT",
     headers: {
@@ -38,98 +51,122 @@ async function flexPut(path: string, body: unknown, token: string): Promise<void
     cache: "no-store",
   });
   if (!res.ok) {
-    throw new Error(`Flex API PUT ${res.status}: ${await res.text()}`);
+    throw new Error(`Flex PUT ${res.status}: ${await res.text()}`);
   }
+  return res.json() as Promise<T>;
 }
 
-// Flex5 inventory model (equipment)
-interface FlexInventoryModel {
-  id: number;
+// ── Flex5 types from OpenAPI spec ──
+
+interface InventoryModel {
+  id: string;
   name: string;
-  shortName?: string;
   barcode?: string;
   manufacturer?: string;
+  size?: string;
   weight?: number;
   height?: number;
-  modelLength?: number;
+  modelLength?: number; // "length" is reserved in Flex, uses "modelLength"
   width?: number;
-  size?: string;
-  groupId?: number;
-  replacementCost?: number;
+  weightUnitId?: string;
+  linearUnitId?: string;
+  groupId?: string;
   masterQuantity?: number;
+  replacementCost?: number;
   virtualModel?: boolean;
   container?: boolean;
+  vehicle?: boolean;
   stackable?: boolean;
-  [key: string]: unknown;
+  shortName?: string;
+  shortNameOrName?: string;
 }
 
-// Flex5 inventory group
-interface FlexInventoryGroup {
-  id: number;
+interface InventoryGroup {
+  id: string | number;
   name: string;
-  [key: string]: unknown;
 }
 
-// Flex5 element (project) from search/grid
-interface FlexElement {
-  id: number;
-  elementName?: string;
-  elementNumber?: string;
-  startDate?: string;
-  endDate?: string;
-  status?: string;
-  [key: string]: unknown;
+// PageProjectElementSearchEntry.content[]
+interface ProjectElementSearchEntry {
+  id: string;
+  name: string;
+  documentNumber?: string;
+  definitionName?: string;
+  parentName?: string;
 }
 
-// Flex5 equipment list line item
-interface FlexLineItem {
-  id: number;
-  modelId?: number;
-  modelName?: string;
-  quantity?: number;
-  rate?: number;
-  [key: string]: unknown;
+// EquipmentList (the full project/element record)
+interface EquipmentList {
+  id: string;
+  name?: string;
+  displayName?: string;
+  documentNumber?: string;
+  parentElementId?: string;
+  plannedStartDate?: string;
+  plannedEndDate?: string;
+  eventDate?: string;
+  showStartDate?: string;
+  showEndDate?: string;
+  statusId?: string;
+  weight?: number;
 }
 
-// Cache for inventory group names
-const groupCache = new Map<number, string>();
+// EquipmentListLineItemNode
+interface LineItemNode {
+  id: string;
+  displayName?: string;
+  resourceId?: string;
+  resourceBarcode?: string;
+  group?: boolean;
+  leaf?: boolean;
+  virtual?: boolean;
+  lineQtyInfo?: { requiredQty?: number };
+}
+
+// Paginated response wrapper
+interface Page<T> {
+  content: T[];
+  totalElements: number;
+  totalPages: number;
+  size: number;
+  number: number;
+}
+
+// ── Group name cache ──
+
+const groupCache = new Map<string, string>();
+
+async function loadGroups(token: string) {
+  if (groupCache.size > 0) return;
+  try {
+    const groups = await flexGet<InventoryGroup[]>("/api/inventory-group/list", token);
+    for (const g of groups) groupCache.set(String(g.id), g.name);
+  } catch { /* non-critical */ }
+}
+
+// ── Provider implementation ──
 
 export const flexProvider: Provider = {
-  id: "flex" as "rentman", // type workaround — registered properly in index.ts
+  id: "flex" as "rentman", // type cast — registered properly in index.ts
   name: "Flex Rental Solutions",
   supportsWrite: true,
 
   async listEquipment(token) {
-    // Load groups for category names
-    if (groupCache.size === 0) {
-      try {
-        const groups = await flexGet<FlexInventoryGroup[]>(
-          "/api/inventory-group/list", token
-        );
-        for (const g of groups) groupCache.set(g.id, g.name);
-      } catch { /* groups not critical */ }
-    }
+    await loadGroups(token);
 
     const items: ProviderEquipment[] = [];
     let page = 0;
     const pageSize = 100;
 
     while (true) {
-      // Use the grid-node endpoint which returns paginated inventory
-      const result = await flexGet<{
-        content?: FlexInventoryModel[];
-        totalElements?: number;
-      }>(
+      const result = await flexGet<Page<InventoryModel>>(
         `/api/inventory-model/search?searchText=&page=${page}&size=${pageSize}`,
         token
       );
-
       const models = result.content ?? [];
       if (models.length === 0) break;
 
-      for (const m of models) {
-        items.push(mapModel(m));
-      }
+      for (const m of models) items.push(mapModel(m));
       if (models.length < pageSize) break;
       page++;
     }
@@ -138,9 +175,8 @@ export const flexProvider: Provider = {
   },
 
   async getEquipment(id, token) {
-    const model = await flexGet<FlexInventoryModel>(
-      `/api/inventory-model/${id}`, token
-    );
+    await loadGroups(token);
+    const model = await flexGet<InventoryModel>(`/api/inventory-model/${id}`, token);
     return mapModel(model);
   },
 
@@ -155,72 +191,92 @@ export const flexProvider: Provider = {
   },
 
   async listProjects(token) {
-    // Elements are Flex's "projects"
-    const result = await flexGet<{
-      content?: FlexElement[];
-    }>(
-      `/api/element/search?page=0&size=50`, token
+    const result = await flexGet<Page<ProjectElementSearchEntry>>(
+      "/api/element/search?searchText=&rootElementsOnly=true&page=0&size=50",
+      token
     );
     return (result.content ?? []).map((e) => ({
       sourceId: String(e.id),
-      displayNumber: e.elementNumber ?? String(e.id),
-      name: e.elementName ?? `Element ${e.id}`,
-      startDate: e.startDate,
-      endDate: e.endDate,
+      displayNumber: e.documentNumber ?? String(e.id),
+      name: e.name ?? `Element ${e.id}`,
+      startDate: undefined,
+      endDate: undefined,
       color: undefined,
-      tags: e.status,
+      tags: e.definitionName,
     }));
   },
 
   async getProject(id, token) {
-    const header = await flexGet<FlexElement>(
-      `/api/element/${id}/header-data`, token
-    );
+    // Get the full equipment list record which has dates and details
+    const el = await flexGet<EquipmentList>(`/api/equipment-list/${id}`, token);
     return {
-      sourceId: String(header.id ?? id),
-      displayNumber: header.elementNumber ?? String(id),
-      name: header.elementName ?? `Element ${id}`,
-      startDate: header.startDate,
-      endDate: header.endDate,
+      sourceId: String(el.id ?? id),
+      displayNumber: el.documentNumber ?? String(id),
+      name: el.displayName ?? el.name ?? `Element ${id}`,
+      startDate: el.plannedStartDate ?? el.showStartDate ?? el.eventDate,
+      endDate: el.plannedEndDate ?? el.showEndDate,
       color: undefined,
-      tags: header.status,
+      tags: undefined,
     };
   },
 
   async listProjectEquipment(projectId, token) {
-    // Equipment list for an element
-    const result = await flexGet<{
-      content?: FlexLineItem[];
-    }>(
-      `/api/equipment-list/${projectId}`, token
-    );
+    // Get line items via the eqlist-line-item endpoint
+    // First we need a root line item — use node-list with the equipment list ID
+    const items: ProviderProjectEquipmentLine[] = [];
 
-    // The response might be a direct array or paginated
-    const items = Array.isArray(result) ? result : (result.content ?? []);
+    try {
+      const result = await flexGet<Page<LineItemNode>>(
+        `/api/eqlist-line-item/node-list/root?equipmentListId=${projectId}&page=0&size=200`,
+        token
+      );
 
-    return items.map((i) => ({
-      lineId: String(i.id),
-      equipmentSourceId: String(i.modelId ?? i.id),
-      name: i.modelName ?? `Item ${i.id}`,
-      quantity: i.quantity ?? 1,
-      unitPrice: i.rate,
-    }));
+      for (const node of result.content ?? []) {
+        if (node.group || node.virtual) continue; // skip group headers and virtual items
+        if (!node.resourceId) continue;
+
+        items.push({
+          lineId: String(node.id),
+          equipmentSourceId: String(node.resourceId),
+          name: node.displayName ?? `Item ${node.id}`,
+          quantity: node.lineQtyInfo?.requiredQty ?? 1,
+        });
+      }
+    } catch {
+      // Fallback: try the line-item row-data endpoint
+      try {
+        const rows = await flexGet<{ content?: Array<{ id: string; dataMap?: Record<string, unknown> }> }>(
+          `/api/line-item/${projectId}/row-data/`,
+          token
+        );
+        for (const row of rows.content ?? []) {
+          items.push({
+            lineId: String(row.id),
+            equipmentSourceId: String(row.id),
+            name: `Line ${row.id}`,
+            quantity: 1,
+          });
+        }
+      } catch { /* give up */ }
+    }
+
+    return items;
   },
 };
 
-function mapModel(m: FlexInventoryModel): ProviderEquipment {
-  const groupName = m.groupId ? (groupCache.get(m.groupId) ?? "Uncategorized") : "Uncategorized";
+function mapModel(m: InventoryModel): ProviderEquipment {
+  const groupName = m.groupId ? (groupCache.get(String(m.groupId)) ?? "Uncategorized") : "Uncategorized";
   return {
     sourceId: String(m.id),
-    name: m.name,
+    name: m.shortNameOrName ?? m.name,
     code: m.barcode,
     category: groupName,
     weight: m.weight ?? undefined,
-    length: m.modelLength ?? undefined, // Flex uses "modelLength" not "length"
+    length: m.modelLength ?? undefined,
     width: m.width ?? undefined,
     height: m.height ?? undefined,
     isPhysical: !m.virtualModel,
-    stockQty: m.masterQuantity ?? undefined,
+    stockQty: m.masterQuantity ? Math.round(m.masterQuantity) : undefined,
     price: m.replacementCost ?? undefined,
   };
 }
