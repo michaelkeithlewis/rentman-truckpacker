@@ -20,9 +20,12 @@ import type {
 } from "./types";
 
 function getBaseUrl(): string {
-  const url = process.env.FLEX_BASE_URL;
-  if (!url) throw new Error("FLEX_BASE_URL not set (e.g. https://yoursite.flexrentalsolutions.com/f5/api)");
-  return url.replace(/\/+$/, "");
+  let url = process.env.FLEX_BASE_URL;
+  if (!url) throw new Error("FLEX_BASE_URL not set (e.g. https://yoursite.flexrentalsolutions.com/f5)");
+  url = url.replace(/\/+$/, "");
+  // Remove trailing /api if present — our paths already include /api/
+  if (url.endsWith("/api")) url = url.slice(0, -4);
+  return url;
 }
 
 async function flexGet<T>(path: string, token: string): Promise<T> {

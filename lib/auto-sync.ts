@@ -53,6 +53,8 @@ async function runSync() {
     const provider = getProvider(providerId);
     const projects = await provider.listProjects(srcToken);
 
+    log.info("auto-sync", `Loaded ${projects.length} projects from ${provider.name}`);
+
     // For non-Rentman providers, we need folders from the provider, not Rentman
     // The incremental sync uses folderMap for category resolution, but
     // the provider already resolves categories in listEquipment/getEquipment.
