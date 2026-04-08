@@ -150,7 +150,7 @@ export const flexProvider: Provider = {
     // Quotes are the main project type in Flex
     // Use element-list/row-data with the Quote definition ID
     const result = await flexGet<Page<ElementListRow>>(
-      "/api/element-list/row-data?definitionId=9bfb850c-b117-11df-b8d5-00e08175e43e&page=0&size=50",
+      "/api/element-list/row-data?definitionId=9bfb850c-b117-11df-b8d5-00e08175e43e&headerFieldTypeIds=DOCUMENT_NUMBER,NAME&page=0&size=50",
       token
     );
     return (result.content ?? []).map((e) => ({
