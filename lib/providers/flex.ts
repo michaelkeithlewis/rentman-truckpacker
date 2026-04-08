@@ -16,6 +16,7 @@ async function flexGet<T>(path: string, token: string): Promise<T> {
     headers: {
       "X-Auth-Token": token,
       "Content-Type": "application/json",
+      Accept: "application/json",
     },
     cache: "no-store",
   });
@@ -31,6 +32,7 @@ async function flexPut(path: string, body: unknown, token: string): Promise<void
     headers: {
       "X-Auth-Token": token,
       "Content-Type": "application/json",
+      Accept: "application/json",
     },
     body: JSON.stringify(body),
     cache: "no-store",
@@ -40,66 +42,95 @@ async function flexPut(path: string, body: unknown, token: string): Promise<void
   }
 }
 
-// Flex5 data models — field names may vary per instance.
-// These are based on common Flex5 API structures.
-interface FlexAsset {
-  assetId: number;
+// Flex5 inventory model (equipment)
+interface FlexInventoryModel {
+  id: number;
   name: string;
-  description?: string;
+  shortName?: string;
   barcode?: string;
-  categoryName?: string;
-  categoryId?: number;
+  manufacturer?: string;
   weight?: number;
-  length?: number;
-  width?: number;
   height?: number;
-  isContainer?: boolean;
+  modelLength?: number;
+  width?: number;
+  size?: string;
+  groupId?: number;
   replacementCost?: number;
-  ownedQuantity?: number;
+  masterQuantity?: number;
+  virtualModel?: boolean;
+  container?: boolean;
+  stackable?: boolean;
   [key: string]: unknown;
 }
 
-interface FlexProject {
-  projectId: number;
+// Flex5 inventory group
+interface FlexInventoryGroup {
+  id: number;
   name: string;
-  projectNumber?: string;
+  [key: string]: unknown;
+}
+
+// Flex5 element (project) from search/grid
+interface FlexElement {
+  id: number;
+  elementName?: string;
+  elementNumber?: string;
   startDate?: string;
   endDate?: string;
   status?: string;
-  statusName?: string;
   [key: string]: unknown;
 }
 
-interface FlexProjectItem {
-  itemId: number;
-  assetId: number;
-  assetName: string;
-  quantity: number;
+// Flex5 equipment list line item
+interface FlexLineItem {
+  id: number;
+  modelId?: number;
+  modelName?: string;
+  quantity?: number;
   rate?: number;
   [key: string]: unknown;
 }
 
+// Cache for inventory group names
+const groupCache = new Map<number, string>();
+
 export const flexProvider: Provider = {
-  id: "flex" as never, // extends ProviderId below
+  id: "flex" as "rentman", // type workaround — registered properly in index.ts
   name: "Flex Rental Solutions",
   supportsWrite: true,
 
   async listEquipment(token) {
+    // Load groups for category names
+    if (groupCache.size === 0) {
+      try {
+        const groups = await flexGet<FlexInventoryGroup[]>(
+          "/api/inventory-group/list", token
+        );
+        for (const g of groups) groupCache.set(g.id, g.name);
+      } catch { /* groups not critical */ }
+    }
+
     const items: ProviderEquipment[] = [];
     let page = 0;
     const pageSize = 100;
 
     while (true) {
-      const assets = await flexGet<FlexAsset[]>(
-        `/assets?offset=${page * pageSize}&limit=${pageSize}`,
+      // Use the grid-node endpoint which returns paginated inventory
+      const result = await flexGet<{
+        content?: FlexInventoryModel[];
+        totalElements?: number;
+      }>(
+        `/api/inventory-model/search?searchText=&page=${page}&size=${pageSize}`,
         token
       );
-      if (!assets || assets.length === 0) break;
 
-      for (const a of assets) {
-        items.push(mapAsset(a));
+      const models = result.content ?? [];
+      if (models.length === 0) break;
+
+      for (const m of models) {
+        items.push(mapModel(m));
       }
-      if (assets.length < pageSize) break;
+      if (models.length < pageSize) break;
       page++;
     }
 
@@ -107,76 +138,89 @@ export const flexProvider: Provider = {
   },
 
   async getEquipment(id, token) {
-    const asset = await flexGet<FlexAsset>(`/assets/${id}`, token);
-    return mapAsset(asset);
+    const model = await flexGet<FlexInventoryModel>(
+      `/api/inventory-model/${id}`, token
+    );
+    return mapModel(model);
   },
 
   async updateEquipment(id, fields, token) {
     const body: Record<string, unknown> = {};
     if (fields.name !== undefined) body.name = fields.name;
     if (fields.weight !== undefined) body.weight = fields.weight;
-    if (fields.length !== undefined) body.length = fields.length;
+    if (fields.length !== undefined) body.modelLength = fields.length;
     if (fields.width !== undefined) body.width = fields.width;
     if (fields.height !== undefined) body.height = fields.height;
-    await flexPut(`/assets/${id}`, body, token);
+    await flexPut(`/api/inventory-model/${id}`, body, token);
   },
 
   async listProjects(token) {
-    const projects = await flexGet<FlexProject[]>(
-      `/projects?offset=0&limit=50`,
-      token
+    // Elements are Flex's "projects"
+    const result = await flexGet<{
+      content?: FlexElement[];
+    }>(
+      `/api/element/search?page=0&size=50`, token
     );
-    return (projects ?? []).map((p) => ({
-      sourceId: String(p.projectId),
-      displayNumber: p.projectNumber ?? String(p.projectId),
-      name: p.name,
-      startDate: p.startDate,
-      endDate: p.endDate,
+    return (result.content ?? []).map((e) => ({
+      sourceId: String(e.id),
+      displayNumber: e.elementNumber ?? String(e.id),
+      name: e.elementName ?? `Element ${e.id}`,
+      startDate: e.startDate,
+      endDate: e.endDate,
       color: undefined,
-      tags: p.statusName,
+      tags: e.status,
     }));
   },
 
   async getProject(id, token) {
-    const p = await flexGet<FlexProject>(`/projects/${id}`, token);
+    const header = await flexGet<FlexElement>(
+      `/api/element/${id}/header-data`, token
+    );
     return {
-      sourceId: String(p.projectId),
-      displayNumber: p.projectNumber ?? String(p.projectId),
-      name: p.name,
-      startDate: p.startDate,
-      endDate: p.endDate,
+      sourceId: String(header.id ?? id),
+      displayNumber: header.elementNumber ?? String(id),
+      name: header.elementName ?? `Element ${id}`,
+      startDate: header.startDate,
+      endDate: header.endDate,
       color: undefined,
-      tags: p.statusName,
+      tags: header.status,
     };
   },
 
   async listProjectEquipment(projectId, token) {
-    const items = await flexGet<FlexProjectItem[]>(
-      `/projects/${projectId}/items?offset=0&limit=200`,
-      token
+    // Equipment list for an element
+    const result = await flexGet<{
+      content?: FlexLineItem[];
+    }>(
+      `/api/equipment-list/${projectId}`, token
     );
-    return (items ?? []).map((i) => ({
-      lineId: String(i.itemId),
-      equipmentSourceId: String(i.assetId),
-      name: i.assetName,
-      quantity: i.quantity,
+
+    // The response might be a direct array or paginated
+    const items = Array.isArray(result) ? result : (result.content ?? []);
+
+    return items.map((i) => ({
+      lineId: String(i.id),
+      equipmentSourceId: String(i.modelId ?? i.id),
+      name: i.modelName ?? `Item ${i.id}`,
+      quantity: i.quantity ?? 1,
       unitPrice: i.rate,
     }));
   },
 };
 
-function mapAsset(a: FlexAsset): ProviderEquipment {
+function mapModel(m: FlexInventoryModel): ProviderEquipment {
+  const groupName = m.groupId ? (groupCache.get(m.groupId) ?? "Uncategorized") : "Uncategorized";
   return {
-    sourceId: String(a.assetId),
-    name: a.name,
-    code: a.barcode,
-    category: a.categoryName ?? "Uncategorized",
-    weight: a.weight ?? undefined,
-    length: a.length ?? undefined,
-    width: a.width ?? undefined,
-    height: a.height ?? undefined,
-    isPhysical: !a.isContainer,
-    stockQty: a.ownedQuantity ?? undefined,
-    price: a.replacementCost ?? undefined,
+    sourceId: String(m.id),
+    name: m.name,
+    code: m.barcode,
+    category: groupName,
+    weight: m.weight ?? undefined,
+    length: m.modelLength ?? undefined, // Flex uses "modelLength" not "length"
+    width: m.width ?? undefined,
+    height: m.height ?? undefined,
+    isPhysical: !m.virtualModel,
+    stockQty: m.masterQuantity ?? undefined,
+    price: m.replacementCost ?? undefined,
   };
 }
