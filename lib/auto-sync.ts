@@ -7,7 +7,7 @@ import * as log from "@/lib/logger";
 import { acquireLock, releaseLock, isSyncing } from "@/lib/sync-lock";
 import type { ProviderId } from "@/lib/providers/types";
 
-const INTERVAL_MS = 30 * 60 * 1000; // 30 minutes (webhooks handle instant updates)
+const INTERVAL_MS = 60 * 60 * 1000; // 60 minutes — conservative to avoid rate limits
 
 const gKey = Symbol.for("app.autoSync");
 const g = globalThis as unknown as Record<symbol, NodeJS.Timeout | null>;
@@ -103,9 +103,14 @@ async function runSync() {
           if (result) synced++;
           else skipped++;
         } catch (e) {
-          log.error("auto-sync", `Failed "${project.name}": ${e instanceof Error ? e.message : e}`);
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes("429")) {
+            log.warn("auto-sync", "Rate limited — stopping sync, will resume next cycle");
+            break;
+          }
+          log.error("auto-sync", `Failed "${project.name}": ${msg}`);
         }
-        await new Promise((r) => setTimeout(r, 1000));
+        await new Promise((r) => setTimeout(r, 2000)); // 2s between projects
       }
     }
 

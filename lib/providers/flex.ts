@@ -196,7 +196,9 @@ export const flexProvider: Provider = {
 
     if (!Array.isArray(rows) || rows.length === 0) return [];
 
-    // Count quantity per resource
+    // Count quantity per resource — DON'T look up each model here
+    // to avoid burning API rate limits. The sync engine will call
+    // getEquipment() for each unique resource when it needs details.
     const byResource = new Map<string, { count: number; lineId: string }>();
     for (const row of rows) {
       if (!row.resourceId) continue;
@@ -208,26 +210,12 @@ export const flexProvider: Provider = {
       }
     }
 
-    // Look up resource names
-    const results: ProviderProjectEquipmentLine[] = [];
-    for (const [resourceId, { count, lineId }] of byResource) {
-      let name = `Resource ${resourceId.slice(0, 8)}`;
-      try {
-        const model = await flexGet<InventoryModel>(
-          `/api/inventory-model/${resourceId}`, token
-        );
-        name = model.shortNameOrName ?? model.name;
-      } catch { /* use default name */ }
-
-      results.push({
-        lineId,
-        equipmentSourceId: resourceId,
-        name,
-        quantity: count,
-      });
-    }
-
-    return results;
+    return [...byResource.entries()].map(([resourceId, { count, lineId }]) => ({
+      lineId,
+      equipmentSourceId: resourceId,
+      name: resourceId, // placeholder — sync engine resolves via getEquipment
+      quantity: count,
+    }));
   },
 };
 
