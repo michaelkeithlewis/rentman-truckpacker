@@ -18,6 +18,12 @@ import { buildSyncCardEntity } from "@/lib/sync-card";
 import type { SyncCardData } from "@/lib/sync-card";
 import * as log from "@/lib/logger";
 import { NextResponse } from "next/server";
+import {
+  effectiveJobKey,
+  findPackForProject,
+  formatPackDisplayName,
+  rentmanEquipmentBracket,
+} from "@/lib/source-tags";
 
 const CM_TO_M = 0.01;
 const FALLBACK = 0.3;
@@ -25,16 +31,6 @@ const COLORS = [
   "#4A90D9", "#E06C75", "#98C379", "#E5C07B", "#C678DD",
   "#56B6C2", "#D19A66", "#61AFEF", "#BE5046", "#7EC699",
 ];
-
-// Stamp format baked into entity names so we can identify Rentman-sourced items
-const RENTMAN_TAG = "RM";
-function stampPackName(projectName: string, projectId: number) {
-  return `[${RENTMAN_TAG}:${projectId}] ${projectName}`;
-}
-function parsePackStamp(name: string): number | null {
-  const m = name.match(/^\[RM:(\d+)\]/);
-  return m ? parseInt(m[1], 10) : null;
-}
 
 interface SyncItem {
   equipmentId: number;
@@ -93,6 +89,13 @@ export async function POST(
     }
 
     const projectName = project.displayname ?? project.name;
+    const jobKey = effectiveJobKey(String(project.number), String(projectId));
+    const packTitle = formatPackDisplayName(
+      "rentman",
+      String(project.number),
+      projectName,
+      jobKey
+    );
 
     // ── Pack: reuse existing or create new ──
     let packId: string;
@@ -108,10 +111,7 @@ export async function POST(
       }
       packId = existingPackId;
     } else {
-      const pack = await createPack(
-        { name: stampPackName(projectName, projectId) },
-        tpKey
-      );
+      const pack = await createPack({ name: packTitle }, tpKey);
       packId = pack._id;
     }
 
@@ -154,7 +154,7 @@ export async function POST(
       for (let i = 0; i < qty; i++) {
         const label = qty > 1 ? `${baseName} #${i + 1}` : baseName;
         entities.push({
-          name: `${label} [RM:${equip.id}]`,
+          name: `${label} ${rentmanEquipmentBracket(equip.id)}`,
           type: "case",
           packId,
           visible: true,
@@ -218,14 +218,21 @@ export async function GET(
 ) {
   try {
     const tpKey = truckpackerKey(req);
+    const rmToken = rentmanToken(req);
     const { id } = await params;
     const projectId = parseInt(id, 10);
 
+    if (!rmToken) {
+      return NextResponse.json(
+        { error: "Rentman token required to resolve project number" },
+        { status: 401 }
+      );
+    }
+
+    const project = await getProject(projectId, rmToken);
+    const jobKey = effectiveJobKey(String(project.number), String(projectId));
     const packs = await listPacks(tpKey);
-    const match = packs.find((p) => {
-      if (!p.name) return false;
-      return parsePackStamp(p.name) === projectId;
-    });
+    const match = findPackForProject(packs, "rentman", jobKey, [String(projectId)]);
 
     return NextResponse.json({
       existingPack: match
