@@ -6,8 +6,34 @@
 import * as log from "@/lib/logger";
 import { acquireLock, releaseLock, isSyncing } from "@/lib/sync-lock";
 import type { ProviderId } from "@/lib/providers/types";
+import {
+  flexDailyQuotaResumeAt,
+  isFlexDailyQuota429Error,
+  isFlexDailyQuotaPaused,
+  pauseFlexUntilNextUtcDay,
+} from "@/lib/flex-api-guard";
 
-const INTERVAL_MS = 60 * 60 * 1000; // 60 minutes — conservative to avoid rate limits
+const INTERVAL_MS_RENTMAN = 60 * 60 * 1000; // 1 hour
+
+/** Flex has a 10k/day hard cap — default 6h + in-memory equipment cache; tune via env. */
+const INTERVAL_MS_FLEX_DEFAULT = 6 * 60 * 60 * 1000;
+
+function getAutoSyncIntervalMs(): number {
+  if (getServerProvider() === "flex") {
+    const raw = process.env.FLEX_AUTO_SYNC_INTERVAL_MS;
+    if (raw) {
+      const n = parseInt(raw, 10);
+      if (!Number.isNaN(n) && n >= 3_600_000) return n;
+    }
+    return INTERVAL_MS_FLEX_DEFAULT;
+  }
+  return INTERVAL_MS_RENTMAN;
+}
+
+function flexAutoSyncDisabled(): boolean {
+  const v = process.env.FLEX_DISABLE_AUTO_SYNC?.toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 
 const gKey = Symbol.for("app.autoSync");
 const g = globalThis as unknown as Record<symbol, NodeJS.Timeout | null>;
@@ -42,6 +68,22 @@ async function runSync() {
   }
 
   const providerId = getServerProvider();
+
+  if (providerId === "flex") {
+    if (flexAutoSyncDisabled()) {
+      log.info("auto-sync", "Flex auto-sync disabled (set FLEX_DISABLE_AUTO_SYNC=1)");
+      releaseLock();
+      return;
+    }
+    if (isFlexDailyQuotaPaused()) {
+      log.info(
+        "auto-sync",
+        `Flex auto-sync skipped — daily quota pause active (resumes ${flexDailyQuotaResumeAt() ?? "unknown"})`
+      );
+      releaseLock();
+      return;
+    }
+  }
 
   try {
     log.info("auto-sync", `Starting background sync (provider: ${providerId})`);
@@ -105,18 +147,25 @@ async function runSync() {
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           if (msg.includes("429")) {
+            if (providerId === "flex" && isFlexDailyQuota429Error(msg)) {
+              pauseFlexUntilNextUtcDay("Flex daily API limit reached");
+            }
             log.warn("auto-sync", "Rate limited — stopping sync, will resume next cycle");
             break;
           }
           log.error("auto-sync", `Failed "${project.name}": ${msg}`);
         }
-        await new Promise((r) => setTimeout(r, 2000)); // 2s between projects
+        await new Promise((r) => setTimeout(r, 3000)); // 3s between Flex projects
       }
     }
 
     log.info("auto-sync", `Background sync complete: ${synced} synced, ${skipped} skipped`);
   } catch (e) {
-    log.error("auto-sync", `Background sync failed: ${e instanceof Error ? e.message : e}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    if (providerId === "flex" && isFlexDailyQuota429Error(msg)) {
+      pauseFlexUntilNextUtcDay("Flex daily API limit reached");
+    }
+    log.error("auto-sync", `Background sync failed: ${msg}`);
   } finally {
     releaseLock();
   }
@@ -124,9 +173,13 @@ async function runSync() {
 
 export function startAutoSync() {
   if (g[gKey]) return;
-  log.info("auto-sync", `Starting background sync (every ${INTERVAL_MS / 1000}s)`);
+  const intervalMs = getAutoSyncIntervalMs();
+  log.info(
+    "auto-sync",
+    `Starting background sync (every ${Math.round(intervalMs / 1000)}s, provider: ${getServerProvider()})`
+  );
   setTimeout(() => runSync(), 5000);
-  g[gKey] = setInterval(() => runSync(), INTERVAL_MS);
+  g[gKey] = setInterval(() => runSync(), intervalMs);
 }
 
 export function stopAutoSync() {

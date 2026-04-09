@@ -453,8 +453,21 @@ export async function syncOneProjectGeneric(
   const pNum = project.displayNumber ?? pid;
   const pName = project.name.trim();
 
-  const lines = await provider.listProjectEquipment(pid, srcToken);
-  if (lines.length === 0) return null;
+  const linesRaw = await provider.listProjectEquipment(pid, srcToken);
+  if (linesRaw.length === 0) return null;
+
+  // One getEquipment per unique source id (defensive if a provider returns duplicate rows)
+  const linesBySource = new Map<string, (typeof linesRaw)[0]>();
+  for (const line of linesRaw) {
+    if (!line.equipmentSourceId) continue;
+    const prev = linesBySource.get(line.equipmentSourceId);
+    if (prev) {
+      prev.quantity += line.quantity ?? 1;
+    } else {
+      linesBySource.set(line.equipmentSourceId, { ...line, quantity: line.quantity ?? 1 });
+    }
+  }
+  const lines = [...linesBySource.values()];
 
   async function resolveCategory(name: string): Promise<string> {
     const key = name.trim().toLowerCase();

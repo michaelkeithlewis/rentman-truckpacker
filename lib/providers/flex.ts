@@ -109,6 +109,18 @@ async function loadGroups(token: string) {
   } catch { /* non-critical */ }
 }
 
+/** Cross-request cache: same inventory model appears on many quotes → one GET per UUID per day. */
+const EQUIP_CACHE = Symbol.for("rentman-truckpacker.flexEquipmentCache");
+const EQUIP_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+type EquipCacheEntry = { equip: ProviderEquipment; storedAt: number };
+
+function equipmentCache(): Map<string, EquipCacheEntry> {
+  const g = globalThis as unknown as Record<symbol, Map<string, EquipCacheEntry>>;
+  if (!g[EQUIP_CACHE]) g[EQUIP_CACHE] = new Map();
+  return g[EQUIP_CACHE];
+}
+
 // ── Provider ──
 
 export const flexProvider: Provider = {
@@ -132,8 +144,16 @@ export const flexProvider: Provider = {
   },
 
   async getEquipment(id, token) {
+    const cache = equipmentCache();
+    const hit = cache.get(id);
+    const now = Date.now();
+    if (hit && now - hit.storedAt < EQUIP_CACHE_TTL_MS) {
+      return hit.equip;
+    }
     await loadGroups(token);
-    return mapModel(await flexGet<InventoryModel>(`/api/inventory-model/${id}`, token));
+    const equip = mapModel(await flexGet<InventoryModel>(`/api/inventory-model/${id}`, token));
+    cache.set(id, { equip, storedAt: now });
+    return equip;
   },
 
   async updateEquipment(id, fields, token) {
