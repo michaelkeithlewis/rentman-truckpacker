@@ -9,7 +9,9 @@ import {
   getPackEntities,
   batchDeleteEntities,
   batchCreateEntities,
+  batchUpdateEntities,
   createPack,
+  updatePack,
   listPacks,
   listCaseCategories,
   createCaseCategory,
@@ -28,6 +30,22 @@ import { buildSyncCardEntity } from "@/lib/sync-card";
 import type { SyncCardData } from "@/lib/sync-card";
 import { smartPack, packedToEntities } from "@/lib/smart-pack";
 import type { Provider, ProviderProject, ProviderEquipment } from "@/lib/providers/types";
+import {
+  buildEquipmentLocalIdMap,
+  effectiveJobKey,
+  findPackForProject,
+  formatPackDisplayName,
+  humanEquipmentBracket,
+  isProviderManagedEntity,
+  packNeedsCanonicalRename,
+  rentmanEquipmentBracket,
+  rentmanVehicleBracket,
+  resolveCaseEntityToSourceId,
+} from "@/lib/source-tags";
+import {
+  getDefaultBoxTruck,
+  defaultSmartPackInteriorM,
+} from "@/lib/default-box-truck";
 
 const CM_TO_M = 0.01;
 const FALLBACK = 0.3;
@@ -36,17 +54,7 @@ const COLORS = [
   "#56B6C2", "#D19A66", "#61AFEF", "#BE5046", "#7EC699",
 ];
 
-const RM_TAG_RE = /\[RM:(\w+)\]/;
 const RM_VEHICLE_RE = /\[RM:V(\d+)\]/;
-
-function isRentmanEntity(e: TPEntity): boolean {
-  return RM_TAG_RE.test(e.name) || e.name.startsWith("SYNC LOG") || e.name.startsWith("SYNC:");
-}
-
-function extractRmTag(name: string): string | null {
-  const m = name.match(RM_TAG_RE);
-  return m ? m[1] : null;
-}
 
 interface VehicleInfo {
   id: number;
@@ -56,6 +64,15 @@ interface VehicleInfo {
   width: number;
   height: number;
   payload_capacity: number;
+}
+
+function rentmanVehicleHasPackDims(v: VehicleInfo): boolean {
+  return (v.length ?? 0) > 0 && (v.width ?? 0) > 0 && (v.height ?? 0) > 0;
+}
+
+function extractRentmanVehicleEntityId(name: string): number | null {
+  const m = name.match(/\[RM:V(\d+)\]/);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 interface SyncProjectResult {
@@ -111,17 +128,54 @@ export async function syncOneProject(
     }
   } catch { /* no vehicle */ }
 
-  // Find or create pack
-  const stampPrefix = `[RM:${pid}]`;
-  let existingPack = allPacks.find((p) => p.name?.startsWith(stampPrefix));
+  const defaultTruck = getDefaultBoxTruck();
+  const effectiveVehicle: VehicleInfo =
+    vehicle && rentmanVehicleHasPackDims(vehicle) ? vehicle : defaultTruck;
+  const effectiveVehicleName =
+    vehicle && rentmanVehicleHasPackDims(vehicle)
+      ? (vehicleName ?? vehicle.displayname ?? vehicle.name)
+      : defaultTruck.displayname;
+
+  // Find or create pack — stamp uses job # (display number), not internal API id
+  const pidStr = String(pid);
+  const jobKey = effectiveJobKey(String(pNum), pidStr);
+  const canonicalPackName = formatPackDisplayName(
+    "rentman",
+    String(pNum),
+    pName,
+    jobKey
+  );
+  let existingPack = findPackForProject(allPacks, "rentman", jobKey, [pidStr]);
   let packId: string;
   let isNewPack = false;
 
   if (existingPack) {
     packId = existingPack._id;
+    if (
+      packNeedsCanonicalRename(
+        existingPack.name,
+        "rentman",
+        jobKey,
+        [pidStr],
+        canonicalPackName
+      )
+    ) {
+      try {
+        const updated = await updatePack(packId, { name: canonicalPackName }, tpKey);
+        existingPack = { ...existingPack, name: updated.name };
+        const pi = allPacks.findIndex((p) => p._id === packId);
+        if (pi >= 0) allPacks[pi] = { ...allPacks[pi], name: updated.name };
+        log.info("sync", `Renamed Rentman pack to job # stamp (${jobKey})`);
+      } catch (e) {
+        log.warn(
+          "sync",
+          `Could not rename Rentman pack: ${e instanceof Error ? e.message : e}`
+        );
+      }
+    }
   } else {
     const pack = await createPack({
-      name: `[RM:${pid}] #${pNum} ${pName}`,
+      name: canonicalPackName,
     }, tpKey);
     packId = pack._id;
     allPacks.push(pack);
@@ -132,8 +186,8 @@ export async function syncOneProject(
   const existingEntities = isNewPack ? [] : await getPackEntities(packId, tpKey);
 
   // Separate Rentman-owned entities from TP-native ones
-  const rmEntities = existingEntities.filter(isRentmanEntity);
-  log.debug("sync", `Pack "${pName}": ${existingEntities.length} existing entities, ${rmEntities.length} RM-tagged`, { packId, isNewPack });
+  const rmEntities = existingEntities.filter((e) => isProviderManagedEntity(e.name));
+  log.debug("sync", `Pack "${pName}": ${existingEntities.length} existing entities, ${rmEntities.length} source-tagged`, { packId, isNewPack });
 
   // Build desired equipment map: equipId → count
   const desiredEquip = new Map<number, { equip: Equipment; qty: number }>();
@@ -172,7 +226,12 @@ export async function syncOneProject(
       existingVehicleEntity = e;
       continue;
     }
-    const tag = extractRmTag(e.name);
+    const tag = resolveCaseEntityToSourceId(
+      e.name,
+      "rentman",
+      jobKey,
+      new Map()
+    );
     if (tag) {
       const list = existingRmCounts.get(tag) ?? [];
       list.push(e);
@@ -188,7 +247,7 @@ export async function syncOneProject(
   // Check for equipment that was REMOVED from the project
   for (const [tag, entities] of existingRmCounts) {
     const eqId = parseInt(tag, 10);
-    if (!desiredEquip.has(eqId)) {
+    if (Number.isNaN(eqId) || !desiredEquip.has(eqId)) {
       for (const e of entities) toDelete.push(e._id);
     }
   }
@@ -207,26 +266,27 @@ export async function syncOneProject(
 
   if (isNewPack || !hasExistingEquipment) {
     // ── SMART PACKING: no existing equipment, arrange everything properly ──
-    const containerWidth = vehicle ? (vehicle.width ?? 0) * CM_TO_M || 2.5 : 2.5;
-    const containerHeight = vehicle ? (vehicle.height ?? 0) * CM_TO_M || 2.5 : 2.5;
+    const containerWidth = (effectiveVehicle.width ?? 0) * CM_TO_M || 2.5;
+    const containerHeight = (effectiveVehicle.height ?? 0) * CM_TO_M || 2.5;
 
     const packableItems: Array<{
-      name: string; equipId: number;
+      name: string; sourceId: string;
       dx: number; dy: number; dz: number;
       weight?: number; categoryId: string; category: string;
     }> = [];
-    const quantities = new Map<number, number>();
+    const quantities = new Map<string, number>();
 
     for (const [eqId, { equip: eq, qty }] of desiredEquip) {
       const l = eq.length ?? 0, w = eq.width ?? 0, h = eq.height ?? 0;
       const dx = l * CM_TO_M, dy = h * CM_TO_M, dz = w * CM_TO_M;
       const cat = equipCategories.get(eqId)!;
       const nm = eq.displayname ?? eq.name;
-      quantities.set(eqId, qty);
+      const sid = String(eqId);
+      quantities.set(sid, qty);
 
       for (let i = 0; i < qty; i++) {
         packableItems.push({
-          name: nm, equipId: eqId,
+          name: nm, sourceId: sid,
           dx, dy, dz,
           weight: eq.weight && eq.weight > 0 ? eq.weight : undefined,
           categoryId: cat.catId, category: cat.catName,
@@ -235,7 +295,10 @@ export async function syncOneProject(
     }
 
     const packed = smartPack(packableItems, containerWidth, containerHeight);
-    toAdd = packedToEntities(packed, packId, quantities);
+    toAdd = packedToEntities(packed, packId, quantities, {
+      equipmentStamp: (s) => rentmanEquipmentBracket(s),
+      manufacturerLabel: (s) => `Rentman #${s}`,
+    });
     unchanged = 0;
 
     log.info("sync", `Smart-packed ${toAdd.length} items into new pack "${pName}"`);
@@ -278,8 +341,9 @@ export async function syncOneProject(
           newItemZ = 0;
           newItemRowDepth = 0;
         }
+        const eqStamp = rentmanEquipmentBracket(eq.id);
         toAdd.push({
-          name: qty > 1 ? `${nm} #${idx} [RM:${eq.id}]` : `${nm} [RM:${eq.id}]`,
+          name: qty > 1 ? `${nm} #${idx} ${eqStamp}` : `${nm} ${eqStamp}`,
           type: "case", packId, visible: true, childrenIds: [],
           position: { x: newItemX - dx / 2, y: dy / 2, z: newItemZ + dz / 2 },
           quaternion: { x: 0, y: 0, z: 0, w: 1 },
@@ -301,26 +365,39 @@ export async function syncOneProject(
   let vehicleAdded = false;
   let vehicleRemoved = false;
 
-  if (vehicle && vehicle.length > 0 && vehicle.width > 0 && vehicle.height > 0) {
-    if (!existingVehicleEntity) {
-      const cdx = vehicle.length * CM_TO_M;
-      const cdy = vehicle.height * CM_TO_M;
-      const cdz = vehicle.width * CM_TO_M;
-      toAdd.push({
-        name: `${vehicleName} [RM:V${vehicle.id}]`,
-        type: "container", packId, visible: true, childrenIds: [],
-        position: { x: cdx / 2, y: cdy / 2, z: cdz / 2 },
-        quaternion: { x: 0, y: 0, z: 0, w: 1 },
-        size: { x: cdx, y: cdy, z: cdz },
-        containerData: { type: "box_truck", payloadCapacity: vehicle.payload_capacity },
-      });
-      vehicleAdded = true;
-    }
-    // If vehicle already exists, leave it (user may have repositioned)
-  } else if (existingVehicleEntity) {
+  const existingVehicleId = existingVehicleEntity
+    ? extractRentmanVehicleEntityId(existingVehicleEntity.name)
+    : null;
+  const desiredVehicleId = effectiveVehicle.id;
+
+  const wrongVehicleAssigned =
+    !!existingVehicleEntity &&
+    (existingVehicleId === null || existingVehicleId !== desiredVehicleId);
+
+  if (wrongVehicleAssigned && existingVehicleEntity) {
     toDelete.push(existingVehicleEntity._id);
     vehicleRemoved = true;
   }
+
+  const noMatchingVehicleEntity =
+    !existingVehicleEntity || wrongVehicleAssigned;
+
+  if (noMatchingVehicleEntity && rentmanVehicleHasPackDims(effectiveVehicle)) {
+    const v = effectiveVehicle;
+    const cdx = v.length * CM_TO_M;
+    const cdy = v.height * CM_TO_M;
+    const cdz = v.width * CM_TO_M;
+    toAdd.push({
+      name: `${effectiveVehicleName} ${rentmanVehicleBracket(v.id)}`,
+      type: "container", packId, visible: true, childrenIds: [],
+      position: { x: cdx / 2, y: cdy / 2, z: cdz / 2 },
+      quaternion: { x: 0, y: 0, z: 0, w: 1 },
+      size: { x: cdx, y: cdy, z: cdz },
+      containerData: { type: "box_truck", payloadCapacity: v.payload_capacity },
+    });
+    vehicleAdded = true;
+  }
+  // If the correct vehicle (or default) already exists, leave it — user may have repositioned
 
   // Sync card: always update (delete ALL old cards + create one new)
   for (const card of existingSyncCards) toDelete.push(card._id);
@@ -332,7 +409,7 @@ export async function syncOneProject(
     projectCreated: project.created ?? now,
     lastSynced: now,
     totalItems: uniq, totalEntities: unchanged + toAdd.length,
-    missingDimensions: missDims, vehicleName,
+    missingDimensions: missDims, vehicleName: effectiveVehicleName,
   } satisfies SyncCardData));
 
   // Execute diff
@@ -388,45 +465,144 @@ export async function syncOneProjectGeneric(
     return cat._id;
   }
 
-  // Find or create pack
-  const stampPrefix = `[RM:${pid}]`;
-  let existingPack = allPacks.find((p) => p.name?.startsWith(stampPrefix));
+  const jobKey = effectiveJobKey(String(pNum), pid);
+  const canonicalPackName = formatPackDisplayName(
+    provider.id,
+    String(pNum),
+    pName,
+    jobKey
+  );
+
+  let existingPack = findPackForProject(allPacks, provider.id, jobKey, [pid]);
   let packId: string;
   let isNewPack = false;
 
   if (existingPack) {
     packId = existingPack._id;
+    if (
+      (provider.id === "flex" || provider.id === "currentrms") &&
+      packNeedsCanonicalRename(
+        existingPack.name,
+        provider.id,
+        jobKey,
+        [pid],
+        canonicalPackName
+      )
+    ) {
+      try {
+        const updated = await updatePack(packId, { name: canonicalPackName }, tpKey);
+        existingPack = { ...existingPack, name: updated.name };
+        const pi = allPacks.findIndex((p) => p._id === packId);
+        if (pi >= 0) allPacks[pi] = { ...allPacks[pi], name: updated.name };
+        log.info("sync", `Renamed pack to job # stamp (${jobKey})`);
+      } catch (e) {
+        log.warn(
+          "sync",
+          `Could not rename pack: ${e instanceof Error ? e.message : e}`
+        );
+      }
+    }
   } else {
-    const pack = await createPack({ name: `[RM:${pid}] #${pNum} ${pName}` }, tpKey);
+    const pack = await createPack({ name: canonicalPackName }, tpKey);
     packId = pack._id;
     allPacks.push(pack);
     isNewPack = true;
   }
 
-  const existingEntities = isNewPack ? [] : await getPackEntities(packId, tpKey);
-  const rmEntities = existingEntities.filter(isRentmanEntity);
-  log.debug("sync", `Pack "${pName}": ${existingEntities.length} existing, ${rmEntities.length} RM-tagged`, { packId, isNewPack });
-
-  // Build desired equipment
   const desiredEquip = new Map<string, { equip: ProviderEquipment; qty: number }>();
-  let missDims = 0, uniq = 0;
+  let missDims = 0,
+    uniq = 0;
 
   for (const line of lines) {
     if (!line.equipmentSourceId) continue;
     let eq: ProviderEquipment;
-    try { eq = await provider.getEquipment(line.equipmentSourceId, srcToken); } catch { continue; }
+    try {
+      eq = await provider.getEquipment(line.equipmentSourceId, srcToken);
+    } catch {
+      continue;
+    }
     if (!eq.isPhysical) continue;
 
-    const hasDims = (eq.length ?? 0) > 0 && (eq.width ?? 0) > 0 && (eq.height ?? 0) > 0;
-    if (!hasDims) { missDims++; continue; }
+    const hasDims =
+      (eq.length ?? 0) > 0 && (eq.width ?? 0) > 0 && (eq.height ?? 0) > 0;
+    if (!hasDims) {
+      missDims++;
+      continue;
+    }
 
     uniq++;
     const existing = desiredEquip.get(eq.sourceId);
-    if (existing) { existing.qty += line.quantity ?? 1; }
-    else { desiredEquip.set(eq.sourceId, { equip: eq, qty: line.quantity ?? 1 }); }
+    if (existing) {
+      existing.qty += line.quantity ?? 1;
+    } else {
+      desiredEquip.set(eq.sourceId, { equip: eq, qty: line.quantity ?? 1 });
+    }
   }
 
-  // Count existing RM entities
+  const equipLocalIds = buildEquipmentLocalIdMap(
+    [...desiredEquip.values()].map((v) => v.equip)
+  );
+
+  let entitiesForDiff: TPEntity[] = isNewPack
+    ? []
+    : await getPackEntities(packId, tpKey);
+
+  let rmEntities = entitiesForDiff.filter((e) =>
+    isProviderManagedEntity(e.name)
+  );
+  log.debug(
+    "sync",
+    `Pack "${pName}": ${entitiesForDiff.length} existing, ${rmEntities.length} source-tagged`,
+    { packId, isNewPack }
+  );
+
+  if (
+    (provider.id === "flex" || provider.id === "currentrms") &&
+    !isNewPack &&
+    rmEntities.length > 0
+  ) {
+    const labelUpdates: Array<{ id: string; name: string }> = [];
+    for (const e of rmEntities) {
+      if (e.name.startsWith("SYNC LOG") || e.name.startsWith("SYNC:")) continue;
+      if (/\[(?:RM|FLX|CRM):V\d+\]/.test(e.name)) continue;
+      const sid = resolveCaseEntityToSourceId(
+        e.name,
+        provider.id,
+        jobKey,
+        equipLocalIds
+      );
+      if (!sid || !desiredEquip.has(sid)) continue;
+      const row = desiredEquip.get(sid)!;
+      const loc = equipLocalIds.get(sid)!;
+      const prov = provider.id === "currentrms" ? "currentrms" : "flex";
+      const stamp = humanEquipmentBracket(prov, jobKey, loc);
+      const idxMatch = e.name.match(/ #(\d+) \[/);
+      const idx = idxMatch ? parseInt(idxMatch[1], 10) : 1;
+      const newName =
+        row.qty > 1
+          ? `${row.equip.name} #${idx} ${stamp}`
+          : `${row.equip.name} ${stamp}`;
+      if (e.name !== newName) labelUpdates.push({ id: e._id, name: newName });
+    }
+    if (labelUpdates.length > 0) {
+      for (let i = 0; i < labelUpdates.length; i += 50) {
+        await batchUpdateEntities(
+          packId,
+          labelUpdates.slice(i, i + 50),
+          tpKey
+        );
+      }
+      log.info(
+        "sync",
+        `Updated ${labelUpdates.length} case labels to job # tags (${jobKey})`
+      );
+      entitiesForDiff = await getPackEntities(packId, tpKey);
+      rmEntities = entitiesForDiff.filter((e) =>
+        isProviderManagedEntity(e.name)
+      );
+    }
+  }
+
   const existingRmCounts = new Map<string, TPEntity[]>();
   const existingSyncCards: TPEntity[] = [];
 
@@ -435,7 +611,12 @@ export async function syncOneProjectGeneric(
       existingSyncCards.push(e);
       continue;
     }
-    const tag = extractRmTag(e.name);
+    const tag = resolveCaseEntityToSourceId(
+      e.name,
+      provider.id,
+      jobKey,
+      equipLocalIds
+    );
     if (tag) {
       const list = existingRmCounts.get(tag) ?? [];
       list.push(e);
@@ -466,29 +647,40 @@ export async function syncOneProjectGeneric(
   if (isNewPack || !hasExistingEquipment) {
     // Smart pack
     const packableItems: Array<{
-      name: string; equipId: number; dx: number; dy: number; dz: number;
+      name: string; sourceId: string; dx: number; dy: number; dz: number;
       weight?: number; categoryId: string; category: string;
     }> = [];
-    const quantities = new Map<number, number>();
+    const quantities = new Map<string, number>();
 
     for (const [, { equip: eq, qty }] of desiredEquip) {
       const dx = (eq.length ?? 0) * CM_TO_M;
       const dy = (eq.height ?? 0) * CM_TO_M;
       const dz = (eq.width ?? 0) * CM_TO_M;
       const catId = equipCategories.get(eq.sourceId)!;
-      const numId = parseInt(eq.sourceId, 10) || 0;
-      quantities.set(numId, qty);
+      const sid = eq.sourceId;
+      quantities.set(sid, qty);
 
       for (let i = 0; i < qty; i++) {
         packableItems.push({
-          name: eq.name, equipId: numId, dx, dy, dz,
+          name: eq.name, sourceId: sid, dx, dy, dz,
           weight: eq.weight, categoryId: catId, category: eq.category,
         });
       }
     }
 
-    const packed = smartPack(packableItems, 2.5, 2.5);
-    toAdd = packedToEntities(packed, packId, quantities);
+    const { width: spW, height: spH } = defaultSmartPackInteriorM();
+    const packed = smartPack(packableItems, spW, spH);
+    toAdd = packedToEntities(packed, packId, quantities, {
+      equipmentStamp: (sid) => {
+        const loc = equipLocalIds.get(sid)!;
+        const prov = provider.id === "currentrms" ? "currentrms" : "flex";
+        return humanEquipmentBracket(prov, jobKey, loc);
+      },
+      manufacturerLabel: (sid) => {
+        const loc = equipLocalIds.get(sid)!;
+        return `${provider.name} #${jobKey}-${loc}`;
+      },
+    });
     log.info("sync", `Smart-packed ${toAdd.length} items for "${pName}"`);
   } else {
     // Incremental — staging area for new items
@@ -515,13 +707,21 @@ export async function syncOneProjectGeneric(
         if (newItemZ + dz > 3 && newItemZ > 0) {
           newItemX -= (newItemRowDepth + 0.1); newItemZ = 0; newItemRowDepth = 0;
         }
+        const loc = equipLocalIds.get(eqId)!;
+        const prov = provider.id === "currentrms" ? "currentrms" : "flex";
+        const eqStamp = humanEquipmentBracket(prov, jobKey, loc);
         toAdd.push({
-          name: qty > 1 ? `${eq.name} #${idx} [RM:${eq.sourceId}]` : `${eq.name} [RM:${eq.sourceId}]`,
+          name: qty > 1 ? `${eq.name} #${idx} ${eqStamp}` : `${eq.name} ${eqStamp}`,
           type: "case", packId, visible: true, childrenIds: [],
           position: { x: newItemX - dx / 2, y: dy / 2, z: newItemZ + dz / 2 },
           quaternion: { x: 0, y: 0, z: 0, w: 1 },
           size: { x: dx, y: dy, z: dz },
-          caseData: { weight: eq.weight, manufacturer: `${provider.name} #${eq.sourceId}`, canRotate3d: false, categoryId: catId },
+          caseData: {
+            weight: eq.weight,
+            manufacturer: `${provider.name} #${jobKey}-${loc}`,
+            canRotate3d: false,
+            categoryId: catId,
+          },
         });
         newItemZ += dz;
         if (dx > newItemRowDepth) newItemRowDepth = dx;

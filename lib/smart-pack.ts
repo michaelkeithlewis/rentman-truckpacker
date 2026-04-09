@@ -22,7 +22,8 @@ const STACKABLE_MAX_HEIGHT = 0.5; // items shorter than this are stackable
 
 interface PackableItem {
   name: string;
-  equipId: number;
+  /** Provider equipment source id (Rentman numeric id as string, Flex UUID, etc.) */
+  sourceId: string;
   dx: number; // length (X)
   dy: number; // height (Y)
   dz: number; // width (Z)
@@ -190,17 +191,24 @@ export function smartPack(
 export function packedToEntities(
   packed: PackedEntity[],
   packId: string,
-  quantities: Map<number, number> // equipId → total qty for naming
+  quantities: Map<string, number>,
+  opts: {
+    equipmentStamp: (sourceId: string) => string;
+    manufacturerLabel: (sourceId: string) => string;
+  }
 ): EntityInput[] {
-  const entityCountByEquip = new Map<number, number>();
+  const entityCountByEquip = new Map<string, number>();
 
   return packed.map((p) => {
-    const count = (entityCountByEquip.get(p.item.equipId) ?? 0) + 1;
-    entityCountByEquip.set(p.item.equipId, count);
-    const totalQty = quantities.get(p.item.equipId) ?? 1;
-    const name = totalQty > 1
-      ? `${p.item.name} #${count} [RM:${p.item.equipId}]`
-      : `${p.item.name} [RM:${p.item.equipId}]`;
+    const sid = p.item.sourceId;
+    const count = (entityCountByEquip.get(sid) ?? 0) + 1;
+    entityCountByEquip.set(sid, count);
+    const totalQty = quantities.get(sid) ?? 1;
+    const stamp = opts.equipmentStamp(sid);
+    const name =
+      totalQty > 1
+        ? `${p.item.name} #${count} ${stamp}`
+        : `${p.item.name} ${stamp}`;
 
     return {
       name,
@@ -213,7 +221,7 @@ export function packedToEntities(
       size: { x: p.item.dx, y: p.item.dy, z: p.item.dz },
       caseData: {
         weight: p.item.weight,
-        manufacturer: `Rentman #${p.item.equipId}`,
+        manufacturer: opts.manufacturerLabel(sid),
         canRotate3d: false,
         categoryId: p.item.categoryId,
       },

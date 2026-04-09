@@ -112,7 +112,7 @@ async function loadGroups(token: string) {
 // ── Provider ──
 
 export const flexProvider: Provider = {
-  id: "flex" as "rentman",
+  id: "flex",
   name: "Flex Rental Solutions",
   supportsWrite: true,
 

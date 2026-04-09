@@ -278,17 +278,20 @@ async function handleDeleteEvent(
   for (const c of existingCats) catMap.set(c.name.trim().toLowerCase(), c._id);
   const colorIdx = { i: existingCats.length };
 
-  // Only sync projects that HAVE packs (don't create new ones on a delete event)
-  const packProjects = new Set(
-    allPacks
-      .filter(p => p.name?.startsWith("[RM:"))
-      .map(p => p.name?.match(/\[RM:(\d+)\]/)?.[1])
-      .filter(Boolean)
-  );
+  // Packs are titled like `#196 Name [RM:196]` (job #) or legacy `[RM:199]…` (API id)
+  const stamped = new Set<string>();
+  for (const p of allPacks) {
+    const name = p.name ?? "";
+    for (const m of name.matchAll(/\[RM:(\d+)\]/g)) {
+      stamped.add(m[1]);
+    }
+  }
 
   let synced = 0;
   for (const project of projects) {
-    if (!packProjects.has(String(project.id))) continue;
+    const byApi = String(project.id);
+    const byNum = String(project.number ?? "");
+    if (!stamped.has(byApi) && !(byNum && stamped.has(byNum))) continue;
     try {
       const result = await syncOneProject(
         project, allPacks, folderMap, catMap, colorIdx, rmToken, tpKey

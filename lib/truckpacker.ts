@@ -126,6 +126,18 @@ export async function createPack(data: { name?: string; folderId?: string }, api
   });
 }
 
+/** Rename / update pack metadata (used to migrate legacy Flex titles). */
+export async function updatePack(
+  id: string,
+  data: { name?: string; folderId?: string | null },
+  apiKey?: string
+): Promise<Pack> {
+  return tpFetch(`/packs/${id}`, apiKey, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
 export async function getPackEntities(packId: string, apiKey?: string): Promise<TPEntity[]> {
   return tpFetch(`/packs/${packId}/entities`, apiKey);
 }
@@ -138,6 +150,24 @@ export async function batchDeleteEntities(
   return tpFetch("/entities:batchDelete", apiKey, {
     method: "POST",
     body: JSON.stringify({ packId, ids }),
+  });
+}
+
+export async function batchUpdateEntities(
+  packId: string,
+  entities: Array<{
+    id: string;
+    name?: string;
+    visible?: boolean;
+    position?: { x: number; y: number; z: number };
+    quaternion?: { x: number; y: number; z: number; w: number };
+    size?: { x: number; y: number; z: number };
+  }>,
+  apiKey?: string
+): Promise<unknown> {
+  return tpFetch("/entities:batchUpdate", apiKey, {
+    method: "POST",
+    body: JSON.stringify({ packId, entities }),
   });
 }
 
